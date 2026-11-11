@@ -2,7 +2,7 @@
    DISASTER DELIVERY — Colyseus game server logic (Colyseus 0.18)
    Started by server.js (local + Colyseus Cloud). Imported by tests.
    ===================================================================== */
-import { defineServer, defineRoom, Room, ServerError, matchMaker, CloseCode } from 'colyseus';
+import { defineServer, defineRoom, Room, ServerError, matchMaker, CloseCode, LocalPresence, LocalDriver, RedisPresence, RedisDriver } from 'colyseus';
 import { schema, t } from '@colyseus/schema';
 import jwt from 'jsonwebtoken';
 import {
@@ -556,7 +556,13 @@ matchMaker.controller.getCorsHeaders = function (headers) {
   return { ...base, 'Access-Control-Allow-Origin': 'null' };
 };
 
+/* Single instance per region → in-memory presence/driver (no Redis needed).
+   Set REDIS_URI only if you scale a region to several instances. Without this,
+   Colyseus Cloud auto-selects Redis on multi-core hosts and waits forever for it. */
+const useRedis = !!env.REDIS_URI;
 export const server = defineServer({
+  presence: useRedis ? new RedisPresence(env.REDIS_URI) : new LocalPresence(),
+  driver: useRedis ? new RedisDriver(env.REDIS_URI) : new LocalDriver(),
   rooms: {
     city: defineRoom(CityRoom).filterBy(['mode'])
   },
