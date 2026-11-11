@@ -7,7 +7,7 @@
    gameplay constants. No Three.js, no DOM, no Node APIs.
    ===================================================================== */
 
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 export const NET = {
   tickRate: 30,                 // fixed simulation steps per second (client + server)
@@ -126,8 +126,8 @@ export function floodAt(floods, x, z) {
    VEHICLES — arcade cargo truck (1 unit = 1 metre; HUD shows km/h)
    --------------------------------------------------------------------- */
 export const VEHICLE = {
-  maxSpeed: 16, reverseSpeed: 6, accel: 8, brake: 22, coast: 3,
-  turnRate: 1.7, radius: 1.45, circleOffset: 3.2, length: 9.5,
+  maxSpeed: 17, reverseSpeed: 6.5, accel: 11, brake: 24, coast: 4.5,
+  turnRate: 1.9, radius: 1.45, circleOffset: 3.2, length: 9.5,
   rearZone: 2.8, doorRange: 3.2, loadMaxSpeed: 1.5, exitMaxSpeed: 2,
   cargoSlots: 3, crashSpeed: 7, crashDamagePerUnit: 6,
   resetCooldownSeconds: 30, idleReturnSeconds: 90
@@ -553,14 +553,17 @@ export function stepVehicle(v, input, dt, world, mods = null) {
   const floodHere = floodAt(mods?.floods, v.x, v.z);
   const max = V.maxSpeed * (floodHere ? DISASTER.flood.vehicleMul : 1);
   let s = v.speed;
+  // punchy launch that tapers off near top speed
+  const pull = V.accel * (1 - 0.6 * Math.min(1, (Math.abs(s) / V.maxSpeed) ** 2));
   if (input.brake) s = Math.sign(s) * Math.max(0, Math.abs(s) - V.brake * dt);
-  else if (input.throttle > 0) s = s < -0.2 ? Math.min(0, s + V.brake * dt) : s + V.accel * input.throttle * dt;
-  else if (input.throttle < 0) s = s > 0.2 ? Math.max(0, s - V.brake * dt) : s + V.accel * 0.7 * input.throttle * dt;
+  else if (input.throttle > 0) s = s < -0.2 ? Math.min(0, s + V.brake * dt) : s + pull * input.throttle * dt;
+  else if (input.throttle < 0) s = s > 0.2 ? Math.max(0, s - V.brake * dt) : s + pull * 0.7 * input.throttle * dt;
   else s = Math.sign(s) * Math.max(0, Math.abs(s) - V.coast * dt);
   if (s > max) s = Math.max(max, s - V.brake * dt);   // ease down when entering water
   if (s < -V.reverseSpeed) s = -V.reverseSpeed;
 
-  const sf = clamp(Math.abs(s) / 4, 0, 1) * (1 - 0.35 * Math.abs(s) / V.maxSpeed);
+  // steering: responsive at low speed, calmer at top speed (no turning on the spot)
+  const sf = clamp(Math.abs(s) / 2.5, 0, 1) * (1 - 0.4 * Math.abs(s) / V.maxSpeed);
   v.yaw -= input.steer * V.turnRate * sf * Math.sign(s) * dt;
   if (v.yaw > Math.PI) v.yaw -= Math.PI * 2; else if (v.yaw < -Math.PI) v.yaw += Math.PI * 2;
 
@@ -586,8 +589,13 @@ export function stepVehicle(v, input, dt, world, mods = null) {
   let impact = 0;
   if (px !== 0 || pz !== 0) {
     nx += px; nz += pz;
-    impact = Math.abs(s);
-    s = Math.abs(s) > 3 ? -s * 0.25 : 0;
+    // slide along walls: only the part of the motion going INTO the obstacle is lost
+    const pl = Math.hypot(px, pz), nxn = px / pl, nzn = pz / pl;
+    const into = -(fx * nxn + fz * nzn) * Math.sign(s);          // 1 = head-on, 0 = scraping along
+    if (into > 0) {
+      impact = Math.abs(s) * into;
+      s *= into > 0.85 ? -0.15 : 1 - into * 0.9;                    // small bounce only when head-on
+    }
   }
   const lim = MAP.playHalf - 2;
   if (nx < -lim || nx > lim || nz < -lim || nz > lim) { nx = clamp(nx, -lim, lim); nz = clamp(nz, -lim, lim); impact = Math.max(impact, Math.abs(s)); s = 0; }

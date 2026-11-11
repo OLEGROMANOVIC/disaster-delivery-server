@@ -12,7 +12,7 @@
 import { Client } from '@colyseus/sdk';
 import net from 'node:net';
 import {
-  NET, GAME, VEHICLE, DISASTER, PACKAGE_TYPES, buildLayout, createPhysicsWorld, resolveInteraction,
+  NET, GAME, VEHICLE, DISASTER, PACKAGE_TYPES, PROTOCOL_VERSION, buildLayout, createPhysicsWorld, resolveInteraction,
   deliveryReward, stepVehicle, stepMovement, walkSpeedMultiplier
 } from './shared.js';
 
@@ -52,8 +52,8 @@ class Bot {
     if (!this.room.state?.players) await new Promise(r => this.room.onStateChange.once(r));
     return this.room;
   }
-  async createPrivate() { this.room = await this.client.create('city', { mode: 'private', protocol: 2 }); return this.wire(); }
-  async joinCode(code) { this.room = await this.client.joinById(code, { protocol: 2 }); return this.wire(); }
+  async createPrivate() { this.room = await this.client.create('city', { mode: 'private', protocol: PROTOCOL_VERSION }); return this.wire(); }
+  async joinCode(code) { this.room = await this.client.joinById(code, { protocol: PROTOCOL_VERSION }); return this.wire(); }
   get me() { return this.room.state.players.get(this.room.sessionId); }
   get s() { return this.room.state; }
   walkInput(mx, mz, sp = false) { this.seq++; this.room.send('input', { i: [[this.seq, mx, mz, sp ? 1 : 0]] }); }

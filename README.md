@@ -87,6 +87,12 @@ Versions: **colyseus 0.18.12**, **@colyseus/schema 5.0.x**, **@colyseus/sdk 0.18
 - Pianos load straight from the ground when a stopped truck's cargo door is within 5 m.
 - Only the driver's inputs move a truck. If the driver drops, the truck stops; their seat is released after the reconnect window. Idle empty trucks return to the depot after 90 s.
 
+**Smoothness & minimap (update):**
+- The simulation runs at 30 Hz. The client draws in between the last two simulation steps, so motion is even on 60, 120 and 144 Hz screens. Before this, half or more of the displayed frames repeated the previous position.
+- The server paces inputs by real time, so a slow tick on a shared cloud CPU can't build up input lag.
+- Trucks: stronger launch that tapers near top speed (17 m/s), eased steering, sliding along walls instead of bouncing, body lean and dip, and a field of view that widens with speed.
+- Minimap (bottom-right): heading-up and circular. Shows flooded roads, the tornado's danger zone, packages, trucks, couriers, your destinations (with edge arrows when off-map) and north. It zooms out while driving.
+
 **Not done in this milestone:**
 - Cooperative two-person carrying. The spec allowed deferring it in favour of trucks.
 - Fall-height damage. The city has no drops yet.

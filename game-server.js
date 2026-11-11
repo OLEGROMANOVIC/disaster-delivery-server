@@ -517,6 +517,8 @@ export class CityRoom extends Room {
   onReconnect(client) {
     const p = this.state.players.get(client.sessionId);
     if (p) p.connected = true;
+    const sim = this.sims.get(client.sessionId);
+    if (sim) { sim.budgetAt = performance.now(); sim.budget = 1; }
     console.log(`[room ${this.roomId}] ${p?.name} reconnected`);
   }
 
@@ -548,7 +550,7 @@ export class CityRoom extends Room {
     return {
       position: { x: sp.x, y: sp.y, z: sp.z }, velocity: { x: 0, z: 0 }, impulse: { x: 0, z: 0 },
       rotationY: sp.rotY, moving: false,
-      queue: [], lastQueuedSeq: 0, lastSeq: 0, budget: 1,
+      queue: [], lastQueuedSeq: 0, lastSeq: 0, budget: 1, budgetAt: performance.now(),
       lastInteract: 0, lastEmote: 0, protectedUntil: 0
     };
   }
@@ -656,6 +658,7 @@ export class CityRoom extends Room {
     sim.velocity.x = sim.velocity.z = 0; sim.impulse.x = sim.impulse.z = 0; sim.moving = false;
     sim.position.x = vs.x; sim.position.z = vs.z;
     vs.idleSince = 0;
+    this.writePlayer(p, sim);          // publish together with `driving` (no stale-position patch)
     return true;
   }
 
@@ -685,10 +688,11 @@ export class CityRoom extends Room {
       if (Math.hypot(pos.x - x, pos.z - z) < 0.05 && !blockedByTruck) {
         sim.position.x = x; sim.position.z = z; sim.position.y = pos.y;
         sim.velocity.x = sim.velocity.z = 0;
+        this.writePlayer(p, sim);      // publish together with `driving` (no stale-position patch)
         return true;
       }
     }
-    if (!requireSpace) { sim.position.x = vs.x + g.rx * 2.9; sim.position.z = vs.z + g.rz * 2.9; return true; }
+    if (!requireSpace) { sim.position.x = vs.x + g.rx * 2.9; sim.position.z = vs.z + g.rz * 2.9; this.writePlayer(p, sim); return true; }
     // nowhere to stand: stay in the truck
     p.driving = v.id; v.driverId = p.sessionId; vs.idleSince = 0;
     return false;
@@ -1051,7 +1055,11 @@ export class CityRoom extends Room {
     for (const [sid, p] of s.players) {
       const sim = this.sims.get(sid);
       if (!sim || p.role !== 'active' || !p.connected) continue;
-      sim.budget = Math.min(sim.budget + 1, NET.inputBudgetCap);
+      // Input pacing follows real time, not tick count: a late tick on a busy host can't build
+      // up a queue (input lag), and clients still can't move faster than 30 steps per second.
+      const tNow = performance.now();
+      sim.budget = Math.min(sim.budget + ((tNow - sim.budgetAt) / (NET.fixedDt * 1000)) * 1.02, NET.inputBudgetCap);
+      sim.budgetAt = tNow;
       const v = p.driving ? s.vehicles.get(p.driving) : null;
       const vs = v ? this.vsims.get(v.id) : null;
       const walkMods = vs ? null : this.walkMods(p, floods, truckCircles);
