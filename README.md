@@ -57,7 +57,7 @@ npm start                      # Colyseus on ws://localhost:2567
 npx serve .                    # in a 2nd terminal: static client, e.g. http://localhost:3000
 ```
 
-Open the client URL in **two browser windows**. Pages on `localhost` or a LAN IP connect to `ws://<same host>:2567` automatically. Add `?server=ws://host:port` to override.
+Open `http://localhost:3000/?local=1` in **two browser windows**. With `?local=1`, the page connects to `ws://<same host>:2567`; without it, it uses the Colyseus Cloud servers. Add `?server=ws://host:port` to override.
 
 Manual checks:
 
@@ -110,7 +110,7 @@ The client is already configured for both regions:
 ### Test against the live servers from your PC
 
 ```bash
-npx serve .        # then open http://localhost:3000/?cloud=1 in two windows
+npx serve .        # then open http://localhost:3000 in two windows
 ```
 
 - Add `&region=us` in one window and `&region=eu` in the other to exercise both regions.
