@@ -49,6 +49,51 @@ Versions: **colyseus 0.18.12**, **@colyseus/schema 5.0.x**, **@colyseus/sdk 0.18
 | Invite link | The INVITE FRIENDS button uses `game.inviteLink(...)`. Without the SDK it copies the room code instead. |
 | Gameplay events | `gameplayStart()` only while you are an active courier in a running round. `gameplayStop()` in menus, results, spectating and while reconnecting. `loadingStart/Stop` during asset loading. No ads are requested. |
 
+## Milestone 3 — disasters, package condition, trucks
+
+**Disasters** (`DisasterController` in `game-server.js`, settings in `DISASTER` in `shared.js`):
+- Three disaster slots per match. In a 240 s match: warning at 0:40, active 0:50–1:20, then 2:00–2:35, then 3:10–3:45.
+- Phases: `inactive → warning → active → recovery`. Times scale with `MATCH_SECONDS`, and each slot picks a type (never the same twice in a row).
+- Everything is in synced state (`state.disaster`). Players who join mid-disaster see it straight away. Results and the next match always start clean.
+- **Tornado:** moves along the road grid on a server-chosen path at 6.5 m/s.
+  - Players within 13 m get a capped, decaying push (outward plus swirl), with 2.5 s of protection after a direct hit.
+  - Carried cargo loses condition inside the 6 m danger radius. A hit in the 3 m core knocks the package out of your hands.
+  - Light packages on the ground drift up to 8 m; heavy ones barely move. Cargo in a truck inside the funnel is damaged too.
+  - The client draws a layered funnel with orbiting debris and a dust ring.
+- **Flood:** the server floods 3 of the 9 predefined road zones (`FLOOD_ZONES`, ids F1–F9). The water rises over 4 s and drains during recovery.
+  - Walking speed: 55% in shallow water, 40% in deep water. Trucks: 70% in shallow water; deep water blocks entry.
+  - Water-sensitive packages lying in water lose condition. Packages carried above the water are safe.
+
+**Packages:** the table is `PACKAGE_TYPES` in `shared.js`. Points, weight, fragility, water sensitivity and spawn chance are all editable.
+
+| Package | Points | Weight | Fragile | Water-sensitive |
+|---|---:|---|---|---|
+| Box | 100 | Light | – | – |
+| Groceries | 150 | Light | ✓ | ✓ |
+| Wooden crate | 250 | Medium (85% speed) | – | – |
+| Aquarium | 650 | Medium | ✓ | – |
+| Sofa | 500 | Heavy (60% speed, no sprint, 2 truck slots) | – | ✓ |
+| Piano | 900 | Very heavy (**truck only**, 3 slots) | ✓ | ✓ |
+| VIP box | 1200 | Medium | ✓ | ✓ |
+
+- Condition runs from 100 to 0. Reward = `base × (0.5 + 0.5 × condition/100)`. At 0 the package breaks: it disappears, a fresh one restocks, and nobody scores.
+- Damage sources: the tornado, flood water while on the ground, dropping a fragile package (**G**) while running, and truck crashes above 7 m/s with fragile cargo.
+- A package left on the ground for 60 s returns to a free depot pad.
+
+**Trucks** (`T1`, `T2`, parked at the depot): the driving model is `stepVehicle()` in `shared.js`, shared by the client's prediction and the server.
+- **E** near a cab door enters; **WASD** drives; **Space** brakes; **E** exits when slow (the server finds a free spot beside the truck). **R** returns an empty truck to the depot (30 s cooldown).
+- Max speed is 16 m/s (58 km/h). The HUD shows km/h.
+- Cargo holds 3 slots. Standing at the cargo door (back of the truck), **E** loads what you carry, takes cargo out, or, at a destination, unloads and delivers directly.
+- Pianos load straight from the ground when a stopped truck's cargo door is within 5 m.
+- Only the driver's inputs move a truck. If the driver drops, the truck stops; their seat is released after the reconnect window. Idle empty trucks return to the depot after 90 s.
+
+**Not done in this milestone:**
+- Cooperative two-person carrying. The spec allowed deferring it in favour of trucks.
+- Fall-height damage. The city has no drops yet.
+- Sound effects.
+
+The truck model's orientation is assumed to be +Z forward. If it drives sideways, set `rotationY` for `cargotruck` in `ASSET_CONFIG` (for example `Math.PI / 2`).
+
 ## Local testing
 
 ```bash
@@ -73,6 +118,15 @@ Manual checks:
    - In the console, `DD.simulateInvite('CODE')` fires the join-room listener.
    - `DD.stats()` shows prediction corrections.
 8. **Real SDK:** upload to the CrazyGames Developer Portal and use the **Preview / QA tool**. This is the only way to test real friends, invites and token verification.
+
+Milestone 3 scenarios (each needs the server started with the settings at the top of `test-milestone3.js`):
+
+```bash
+MATCH_SECONDS=300 DISASTER_TYPES=none PACKAGE_POOL=groceries DROP_DAMAGE=60 RECONNECT_SECONDS=3 npm start   # terminal 1
+SCENARIO=trucks npm run test:m3                                                                             # terminal 2
+```
+
+Manual checks in two windows: pick up a package and watch the condition bar. Load it into a truck (cargo door at the back), drive, and get out. Wait 40 s for the first disaster warning; both windows should show the same tornado or the same flooded roads.
 
 Automated server tests (real Colyseus clients):
 

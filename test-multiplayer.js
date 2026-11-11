@@ -9,7 +9,7 @@
    ===================================================================== */
 import { Client } from '@colyseus/sdk';
 import {
-  NET, GAME, ROADS, buildLayout, createPhysicsWorld, stepMovement, sanitizeMoveInput
+  NET, GAME, ROADS, PROTOCOL_VERSION, buildLayout, createPhysicsWorld, stepMovement, sanitizeMoveInput
 } from './shared.js';
 import { isOriginAllowed } from './game-server.js';
 import net from 'node:net';
@@ -46,7 +46,7 @@ function cutNetwork() { for (const s of proxySockets) s.destroy(); }
 
 class Bot {
   constructor(label, skin = 1, url = URL_) { this.label = label; this.skin = skin; this.client = new Client(url); this.seq = 0; this.timer = null; }
-  opts(extra = {}) { return { skin: this.skin, protocol: 1, ...extra }; }
+  opts(extra = {}) { return { skin: this.skin, protocol: PROTOCOL_VERSION, ...extra }; }
   async playOnline() { this.room = await this.client.joinOrCreate('city', this.opts({ mode: 'public' })); return this.wire(); }
   async createPrivate() { this.room = await this.client.create('city', this.opts({ mode: 'private' })); return this.wire(); }
   async joinCode(code) { this.room = await this.client.joinById(code, this.opts()); return this.wire(); }

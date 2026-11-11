@@ -7,7 +7,7 @@
    gameplay constants. No Three.js, no DOM, no Node APIs.
    ===================================================================== */
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 export const NET = {
   tickRate: 30,                 // fixed simulation steps per second (client + server)
@@ -33,12 +33,124 @@ export const GAME = {
   emoteCooldownMs: 1500
 };
 
-/* Configurable rewards. `model` is the GLB key used on the client. */
-export const PACKAGE_TYPES = {
-  box:       { label: 'Standard box', model: 'box',          reward: 100, weight: 6 },
-  groceries: { label: 'Groceries',    model: 'groceriesbox', reward: 150, weight: 3 },
-  vip:       { label: 'VIP package',  model: 'vipbox',       reward: 500, weight: 1 }
+/* ---------------------------------------------------------------------
+   PACKAGES — configurable delivery table
+   reward: base points · weight: WEIGHT_CLASSES key · fragile: takes knock
+   damage · waterSensitive: damaged by flood water while on the ground or in
+   an open truck bed · spawnWeight: relative spawn chance · model: GLB key
+   --------------------------------------------------------------------- */
+export const WEIGHT_CLASSES = {
+  light:     { label: 'Light',      speedMul: 1.0,  canSprint: true,  slots: 1, onFoot: true,  tornadoPush: 1.0 },
+  medium:    { label: 'Medium',     speedMul: 0.85, canSprint: true,  slots: 1, onFoot: true,  tornadoPush: 0.5 },
+  heavy:     { label: 'Heavy',      speedMul: 0.6,  canSprint: false, slots: 2, onFoot: true,  tornadoPush: 0.15 },
+  veryheavy: { label: 'Very heavy', speedMul: 0,    canSprint: false, slots: 3, onFoot: false, tornadoPush: 0 }
 };
+export const PACKAGE_TYPES = {
+  box:       { label: 'Box',          model: 'box',          reward: 100,  weight: 'light',     fragile: false, waterSensitive: false, spawnWeight: 30 },
+  groceries: { label: 'Groceries',    model: 'groceriesbox', reward: 150,  weight: 'light',     fragile: true,  waterSensitive: true,  spawnWeight: 22 },
+  crate:     { label: 'Wooden crate', model: 'woodenbox',    reward: 250,  weight: 'medium',    fragile: false, waterSensitive: false, spawnWeight: 16 },
+  aquarium:  { label: 'Aquarium',     model: 'aquarium',     reward: 650,  weight: 'medium',    fragile: true,  waterSensitive: false, spawnWeight: 9 },
+  sofa:      { label: 'Sofa',         model: 'sofa',         reward: 500,  weight: 'heavy',     fragile: false, waterSensitive: true,  spawnWeight: 9 },
+  piano:     { label: 'Piano',        model: 'piano',        reward: 900,  weight: 'veryheavy', fragile: true,  waterSensitive: true,  spawnWeight: 7 },
+  vip:       { label: 'VIP box',      model: 'vipbox',       reward: 1200, weight: 'medium',    fragile: true,  waterSensitive: true,  spawnWeight: 4 }
+};
+export const CONDITION = {
+  dropSpeedThreshold: 7,       // dropping while moving faster than this damages fragile cargo
+  dropDamage: 12,
+  groundReturnSeconds: 60,     // a package left on the ground away from the depot returns to a free pad
+  brokenRespawnSeconds: 3
+};
+export function packageDef(type) { return PACKAGE_TYPES[type] || PACKAGE_TYPES.box; }
+export function weightOf(type) { return WEIGHT_CLASSES[packageDef(type).weight] || WEIGHT_CLASSES.light; }
+export function conditionLabel(c) { return c <= 0 ? 'Broken' : c < 50 ? 'Severely damaged' : c < 80 ? 'Damaged' : 'Excellent'; }
+/* finalReward = basePoints * (0.5 + 0.5 * condition / 100); broken = 0 */
+export function deliveryReward(base, condition) {
+  if (condition <= 0) return 0;
+  return Math.round(base * (0.5 + 0.5 * Math.min(100, condition) / 100));
+}
+
+/* ---------------------------------------------------------------------
+   DISASTERS — schedule is written for a 240 s match and scaled to the
+   configured match length. Types are picked by the server per slot.
+   --------------------------------------------------------------------- */
+export const DISASTER = {
+  types: ['tornado', 'flood'],          // future: 'earthquake', 'storm', ...
+  baseMatchSeconds: 240,
+  schedule: [
+    { warn: 40,  start: 50,  end: 80 },
+    { warn: 110, start: 120, end: 155 },
+    { warn: 180, start: 190, end: 225 }
+  ],
+  recoverySeconds: 6,
+  tornado: {
+    speed: 6.5, pushRadius: 13, dangerRadius: 6, coreRadius: 3,
+    force: 26, maxImpulse: 9, protectSeconds: 2.5,
+    carryDamagePerSec: { fragile: 30, normal: 6 },
+    knockDamage: { fragile: 15, normal: 4 },
+    groundPushSpeed: 3.2, groundMaxDisplacement: 8, groundFragileDamagePerSec: 6,
+    vehicleForce: 6, vehicleCargoDamagePerSec: 10
+  },
+  flood: {
+    zonesPerEvent: 3, riseSeconds: 4,
+    walkMul: { shallow: 0.55, deep: 0.4 },
+    vehicleMul: 0.7,                     // shallow water
+    deepBlocksVehicles: true,
+    depth: { shallow: 0.35, deep: 0.9 },
+    groundDamagePerSec: 8                // water-sensitive packages lying in water
+  }
+};
+
+/* Predefined flood areas (road segments). Unique ids; server picks which flood. */
+export const FLOOD_ZONES = [
+  { id: 'F1', label: 'South Avenue',      minX: -19, maxX: 19,  minZ: 19,  maxZ: 31,  deep: false },
+  { id: 'F2', label: 'North Avenue',      minX: -19, maxX: 19,  minZ: -31, maxZ: -19, deep: false },
+  { id: 'F3', label: 'West Avenue',       minX: -31, maxX: -19, minZ: -19, maxZ: 19,  deep: false },
+  { id: 'F4', label: 'East Avenue',       minX: 19,  maxX: 31,  minZ: -19, maxZ: 19,  deep: false },
+  { id: 'F5', label: 'East Avenue South', minX: 19,  maxX: 31,  minZ: 31,  maxZ: 69,  deep: false },
+  { id: 'F6', label: 'South Avenue East', minX: 31,  maxX: 69,  minZ: 19,  maxZ: 31,  deep: false },
+  { id: 'F7', label: 'West Ring Road',    minX: -81, maxX: -69, minZ: -19, maxZ: 19,  deep: true },
+  { id: 'F8', label: 'North Ring Road',   minX: -19, maxX: 19,  minZ: -81, maxZ: -69, deep: true },
+  { id: 'F9', label: 'South-East Junction', minX: 19, maxX: 31, minZ: 19,  maxZ: 31,  deep: true }
+];
+/* floods: [{minX,maxX,minZ,maxZ,depth,deep}] with depth already scaled by the water level */
+export function floodAt(floods, x, z) {
+  let best = null;
+  if (!floods) return null;
+  for (const f of floods) {
+    if (f.depth > 0.05 && x >= f.minX && x <= f.maxX && z >= f.minZ && z <= f.maxZ && (!best || f.depth > best.depth)) best = f;
+  }
+  return best;
+}
+
+/* ---------------------------------------------------------------------
+   VEHICLES — arcade cargo truck (1 unit = 1 metre; HUD shows km/h)
+   --------------------------------------------------------------------- */
+export const VEHICLE = {
+  maxSpeed: 16, reverseSpeed: 6, accel: 8, brake: 22, coast: 3,
+  turnRate: 1.7, radius: 1.45, circleOffset: 3.2, length: 9.5,
+  rearZone: 2.8, doorRange: 3.2, loadMaxSpeed: 1.5, exitMaxSpeed: 2,
+  cargoSlots: 3, crashSpeed: 7, crashDamagePerUnit: 6,
+  resetCooldownSeconds: 30, idleReturnSeconds: 90
+};
+export function vehicleGeometry(v) {
+  const fx = Math.sin(v.yaw), fz = Math.cos(v.yaw);
+  const rx = fz, rz = -fx;
+  const o = VEHICLE.circleOffset;
+  return {
+    fx, fz, rx, rz,
+    rearX: v.x - fx * (VEHICLE.length / 2 + 1.3), rearZ: v.z - fz * (VEHICLE.length / 2 + 1.3),
+    circles: [{ x: v.x + fx * o, z: v.z + fz * o }, { x: v.x, z: v.z }, { x: v.x - fx * o, z: v.z - fz * o }],
+    doors: [
+      { x: v.x + fx * 2.2 + rx * 2.3, z: v.z + fz * 2.2 + rz * 2.3 },
+      { x: v.x + fx * 2.2 - rx * 2.3, z: v.z + fz * 2.2 - rz * 2.3 }
+    ]
+  };
+}
+export function cargoSlotsUsed(cargoIds, packages) {
+  let n = 0;
+  for (const id of cargoIds) { const p = packages.get(id); if (p) n += weightOf(p.type).slots; }
+  return n;
+}
 
 export const EMOTES = ['Help!', 'Follow me!', 'Deliver here!', 'Thanks!', "Let's go!"];
 
@@ -170,10 +282,13 @@ export function buildLayout() {
     place('woodenbox', cx - 13.6, backZ + 10.0, 0.2);
     place('woodenbox', cx - 13.6, backZ + 8.6, 0.35, { stack: 1, collider: false });
     place('woodenbox', cx + 13.6, backZ + 8.6, -0.15);
-    place('palletjack', cx - 9.5, cz + 4, 0.6);
-    place('platformcart', cx - 11.5, cz + 9, -0.4);
-    place('cargotruck', cx + 11.5, cz + 4, 0);
-    boxCollider(cx + 11.5, cz + 4, 1.4, 4.6, h + 3.5, false, 'cargotruck');
+    place('palletjack', cx + 9.6, backZ + 10.8, 0.6);
+    place('platformcart', cx - 9.6, backZ + 10.8, -0.4);
+    // Drivable trucks (dynamic, server-owned): parked facing the south avenue
+    L.vehicleSpawns = [
+      { id: 'T1', x: cx + 11.5, z: cz + 4, yaw: 0 },
+      { id: 'T2', x: cx - 11.5, z: cz + 4, yaw: 0 }
+    ];
   }
 
   /* ---- park ---- */
@@ -341,11 +456,35 @@ export function sanitizeMoveInput(raw) {
 }
 
 const _n = { x: 0, z: 0 };
-export function stepMovement(state, input, dt, world) {
+/* Push a circle out of other circles (trucks). Returns true if pushed. */
+function resolveCircles(pos, r, circles, out) {
+  let pushed = false;
+  if (!circles) return false;
+  for (const c of circles) {
+    const dx = pos.x - c.x, dz = pos.z - c.z, rr = r + c.r;
+    const d2 = dx * dx + dz * dz;
+    if (d2 >= rr * rr) continue;
+    const d = Math.sqrt(d2) || 1e-4;
+    const nx = d2 > 1e-8 ? dx / d : 1, nz = d2 > 1e-8 ? dz / d : 0, pen = rr - d;
+    pos.x += nx * pen; pos.z += nz * pen;
+    out.x += nx; out.z += nz;
+    pushed = true;
+  }
+  return pushed;
+}
+export function walkSpeedMultiplier(mods, x, z) {
+  let mul = mods?.carryMul ?? 1;
+  const f = floodAt(mods?.floods, x, z);
+  if (f) mul *= f.deep ? DISASTER.flood.walkMul.deep : DISASTER.flood.walkMul.shallow;
+  return mul;
+}
+/* mods (optional): { carryMul, canSprint, floods, circles:[{x,z,r}] } */
+export function stepMovement(state, input, dt, world, mods = null) {
   const P = PLAYER, v = state.velocity, pos = state.position;
   const ix = input.mx, iz = input.mz;
   const hasInput = ix !== 0 || iz !== 0;
-  const speed = input.sp ? P.sprintSpeed : P.walkSpeed;
+  const canSprint = mods?.canSprint !== false;
+  const speed = (input.sp && canSprint ? P.sprintSpeed : P.walkSpeed) * walkSpeedMultiplier(mods, pos.x, pos.z);
   const k = 1 - Math.exp(-(hasInput ? P.acceleration : P.deceleration) * dt);
   v.x += (ix * speed - v.x) * k;
   v.z += (iz * speed - v.z) * k;
@@ -353,8 +492,17 @@ export function stepMovement(state, input, dt, world) {
 
   pos.x += v.x * dt;
   pos.z += v.z * dt;
+  // external impulse (tornado) decays smoothly; synced so prediction replays it
+  const imp = state.impulse;
+  if (imp && (imp.x !== 0 || imp.z !== 0)) {
+    pos.x += imp.x * dt; pos.z += imp.z * dt;
+    const k2 = Math.exp(-3.5 * dt);
+    imp.x *= k2; imp.z *= k2;
+    if (Math.abs(imp.x) < 0.05 && Math.abs(imp.z) < 0.05) { imp.x = 0; imp.z = 0; }
+  }
 
   const n = world.resolveCircle(pos, P.radius, _n);
+  resolveCircles(pos, P.radius, mods?.circles, n);
   const nl = Math.hypot(n.x, n.z);
   if (nl > 0) {
     const nx = n.x / nl, nz = n.z / nl;
@@ -385,3 +533,147 @@ export function stepMovement(state, input, dt, world) {
 }
 
 export function distanceXZ(ax, az, bx, bz) { return Math.hypot(ax - bx, az - bz); }
+
+/* =====================================================================
+   VEHICLE STEP (identical on client prediction and server authority)
+   v: { x, z, yaw, speed } · input: { steer, throttle, brake } (-1..1)
+   mods: { floods, circles } · returns impact speed when it hits something
+   ===================================================================== */
+export function sanitizeDriveInput(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  let steer = Number(raw.steer), throttle = Number(raw.throttle);
+  if (!Number.isFinite(steer) || !Number.isFinite(throttle)) return null;
+  steer = Math.round(clamp(steer, -1, 1) * 1000) / 1000;
+  throttle = Math.round(clamp(throttle, -1, 1) * 1000) / 1000;
+  return { steer, throttle, brake: raw.brake === true || raw.brake === 1 };
+}
+const _vp = { x: 0, y: 0.3, z: 0 }, _vn = { x: 0, z: 0 };
+export function stepVehicle(v, input, dt, world, mods = null) {
+  const V = VEHICLE;
+  const floodHere = floodAt(mods?.floods, v.x, v.z);
+  const max = V.maxSpeed * (floodHere ? DISASTER.flood.vehicleMul : 1);
+  let s = v.speed;
+  if (input.brake) s = Math.sign(s) * Math.max(0, Math.abs(s) - V.brake * dt);
+  else if (input.throttle > 0) s = s < -0.2 ? Math.min(0, s + V.brake * dt) : s + V.accel * input.throttle * dt;
+  else if (input.throttle < 0) s = s > 0.2 ? Math.max(0, s - V.brake * dt) : s + V.accel * 0.7 * input.throttle * dt;
+  else s = Math.sign(s) * Math.max(0, Math.abs(s) - V.coast * dt);
+  if (s > max) s = Math.max(max, s - V.brake * dt);   // ease down when entering water
+  if (s < -V.reverseSpeed) s = -V.reverseSpeed;
+
+  const sf = clamp(Math.abs(s) / 4, 0, 1) * (1 - 0.35 * Math.abs(s) / V.maxSpeed);
+  v.yaw -= input.steer * V.turnRate * sf * Math.sign(s) * dt;
+  if (v.yaw > Math.PI) v.yaw -= Math.PI * 2; else if (v.yaw < -Math.PI) v.yaw += Math.PI * 2;
+
+  let nx = v.x + Math.sin(v.yaw) * s * dt, nz = v.z + Math.cos(v.yaw) * s * dt;
+  // deep water blocks entry
+  if (DISASTER.flood.deepBlocksVehicles) {
+    const fNext = floodAt(mods?.floods, nx, nz);
+    if (fNext?.deep && !floodHere?.deep) { v.speed = 0; return 0; }
+  }
+  // collision: three circles along the truck vs static boxes + other trucks
+  const fx = Math.sin(v.yaw), fz = Math.cos(v.yaw), o = V.circleOffset;
+  let px = 0, pz = 0;
+  for (const off of [o, 0, -o]) {
+    _vp.x = nx + fx * off; _vp.z = nz + fz * off; _vp.y = 0.3;
+    const bx = _vp.x, bz = _vp.z;
+    world.resolveCircle(_vp, V.radius, _vn);
+    _vn.x = 0; _vn.z = 0;
+    resolveCircles(_vp, V.radius, mods?.circles, _vn);
+    const dx = _vp.x - bx, dz = _vp.z - bz;
+    if (Math.abs(dx) > Math.abs(px)) px = dx;
+    if (Math.abs(dz) > Math.abs(pz)) pz = dz;
+  }
+  let impact = 0;
+  if (px !== 0 || pz !== 0) {
+    nx += px; nz += pz;
+    impact = Math.abs(s);
+    s = Math.abs(s) > 3 ? -s * 0.25 : 0;
+  }
+  const lim = MAP.playHalf - 2;
+  if (nx < -lim || nx > lim || nz < -lim || nz > lim) { nx = clamp(nx, -lim, lim); nz = clamp(nz, -lim, lim); impact = Math.max(impact, Math.abs(s)); s = 0; }
+  v.x = nx; v.z = nz; v.speed = Math.abs(s) < 0.02 ? 0 : s;
+  return impact;
+}
+export function vehicleCircles(vehicles, exceptId = null) {
+  const out = [];
+  for (const v of vehicles) {
+    if (v.id === exceptId) continue;
+    for (const c of vehicleGeometry(v).circles) out.push({ x: c.x, z: c.z, r: VEHICLE.radius });
+  }
+  return out;
+}
+
+/* =====================================================================
+   INTERACTION RULES — one function decides what "E" does.
+   The server executes the result; the client shows it as a prompt.
+   ctx: { x, z, carrying, driving, packages (Map), vehicles (Map), destinations (Map) }
+   ===================================================================== */
+const dist = (ax, az, bx, bz) => Math.hypot(ax - bx, az - bz);
+export function resolveInteraction(ctx) {
+  const { x, z, packages, vehicles, destinations } = ctx;
+  const V = VEHICLE;
+  if (ctx.driving) {
+    const v = vehicles.get(ctx.driving);
+    if (!v) return { kind: 'none' };
+    return Math.abs(v.speed) <= V.exitMaxSpeed ? { kind: 'exitVehicle', vehicleId: v.id } : { kind: 'none', reason: 'slowDownToExit' };
+  }
+  // trucks whose cargo door is next to the player and that are (almost) stopped
+  let rearTruck = null, rearD = V.rearZone;
+  let doorTruck = null, doorD = V.doorRange;
+  for (const v of vehicles.values()) {
+    const g = vehicleGeometry(v);
+    const dr = dist(x, z, g.rearX, g.rearZ);
+    if (dr <= rearD && Math.abs(v.speed) <= V.loadMaxSpeed) { rearTruck = v; rearD = dr; }
+    for (const d of g.doors) {
+      const dd = dist(x, z, d.x, d.z);
+      if (dd <= doorD && !v.driverId) { doorTruck = v; doorD = dd; }
+    }
+  }
+  const carried = ctx.carrying ? packages.get(ctx.carrying) : null;
+  if (carried) {
+    const dest = destinations.get(carried.destinationId);
+    if (dest && dist(x, z, dest.x, dest.z) <= GAME.deliveryRadius) return { kind: 'deliver', packageId: carried.id };
+    if (rearTruck) {
+      const free = V.cargoSlots - cargoSlotsUsed(rearTruck.cargo, packages);
+      return free >= weightOf(carried.type).slots
+        ? { kind: 'loadCarried', packageId: carried.id, vehicleId: rearTruck.id }
+        : { kind: 'none', reason: 'truckFull', vehicleId: rearTruck.id };
+    }
+    return { kind: 'none', reason: 'carrying' };
+  }
+  // deliver straight from a truck parked at the destination
+  if (rearTruck) {
+    for (const id of rearTruck.cargo) {
+      const p = packages.get(id);
+      const dest = p && destinations.get(p.destinationId);
+      if (dest && dist(x, z, dest.x, dest.z) <= GAME.deliveryRadius + 1.5) return { kind: 'deliverFromTruck', packageId: id, vehicleId: rearTruck.id };
+    }
+  }
+  // nearest package on the ground
+  let best = null, bestD = GAME.pickupRadius;
+  for (const p of packages.values()) {
+    if (p.status !== 'available') continue;
+    const d = dist(x, z, p.x, p.z);
+    if (d <= bestD) { best = p; bestD = d; }
+  }
+  if (best) {
+    const w = weightOf(best.type);
+    if (w.onFoot) return { kind: 'pickup', packageId: best.id };
+    for (const v of vehicles.values()) {
+      const g = vehicleGeometry(v);
+      if (Math.abs(v.speed) <= V.loadMaxSpeed && dist(best.x, best.z, g.rearX, g.rearZ) <= 5 &&
+          V.cargoSlots - cargoSlotsUsed(v.cargo, packages) >= w.slots) {
+        return { kind: 'loadHeavy', packageId: best.id, vehicleId: v.id };
+      }
+    }
+    return { kind: 'none', reason: 'needTruck', packageId: best.id };
+  }
+  if (rearTruck) {
+    for (let i = rearTruck.cargo.length - 1; i >= 0; i--) {
+      const p = packages.get(rearTruck.cargo[i]);
+      if (p && weightOf(p.type).onFoot) return { kind: 'unload', packageId: p.id, vehicleId: rearTruck.id };
+    }
+  }
+  if (doorTruck) return { kind: 'enterVehicle', vehicleId: doorTruck.id };
+  return { kind: 'none' };
+}

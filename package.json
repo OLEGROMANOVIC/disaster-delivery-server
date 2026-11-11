@@ -7,7 +7,8 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node test-multiplayer.js",
-    "test:server": "MATCH_SECONDS=45 INTERMISSION_SECONDS=4 LATE_JOIN_SECONDS=5 RECONNECT_SECONDS=6 node server.js",
+    "test:server": "MATCH_SECONDS=45 INTERMISSION_SECONDS=4 LATE_JOIN_SECONDS=5 RECONNECT_SECONDS=6 DISASTER_TYPES=none PACKAGE_POOL=box,groceries node server.js",
+    "test:m3": "node test-milestone3.js",
     "build": "node --check shared.js && node --check game-server.js && node --check server.js"
   },
   "engines": {
