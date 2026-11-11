@@ -1,0 +1,25 @@
+{
+  "name": "disaster-delivery",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test-multiplayer.js",
+    "test:server": "MATCH_SECONDS=45 INTERMISSION_SECONDS=4 LATE_JOIN_SECONDS=5 RECONNECT_SECONDS=6 node server.js",
+    "build": "node --check shared.js && node --check game-server.js && node --check server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@colyseus/schema": "^5.0.47",
+    "colyseus": "^0.18.12",
+    "express": "^5.3.0",
+    "jsonwebtoken": "^9.0.3"
+  },
+  "devDependencies": {
+    "@colyseus/sdk": "^0.18.10"
+  }
+}
