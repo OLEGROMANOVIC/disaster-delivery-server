@@ -267,7 +267,7 @@ async function live() {
   console.log(`   arrived=${arrived} carrying=${b.me.carrying} dist=${Math.hypot(b.me.x - dest.x, b.me.z - dest.z).toFixed(2)} golden=${JSON.stringify(a.s.packages.get(gold.id)?.toJSON?.())}`);
   const del = await b.interact();
   await waitFor(() => b.me.rushScore > 0, 1500);
-  check('G6 delivering it pays the condition-based golden reward to the rush score', del?.ok && del.reward === deliveryReward(PACKAGE_TYPES.golden.reward, cond) && b.me.rushScore >= del.reward, JSON.stringify(del));
+  check('G6 delivering it pays the condition-based golden reward to the rush score', del?.ok && del.base === deliveryReward(PACKAGE_TYPES.golden.reward, cond) && del.reward >= del.base && b.me.rushScore >= del.reward, JSON.stringify(del));
   check('G7 at most one Golden Package per rush (not restocked)', ![...a.s.packages.values()].some(p => p.type === 'golden'));
 
   /* --- results + breaks --- */

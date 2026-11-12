@@ -13,6 +13,8 @@
     "test:m4": "node test-milestone4.js",
     "test:botserver": "BOT_FILL=4 BOT_JOIN_DELAY=0.6 FIRST_FREE_PLAY_SECONDS=40 RUSH_WARNING_SECONDS=3 RUSH_SECONDS=70 RESULTS_SECONDS=5 INTERMISSION_SECONDS=4 DISASTER_TYPES=none GOLDEN_AT=4 GOLDEN_SPOT=0 PACKAGE_POOL=box,groceries,crate node server.js",
     "test:bots": "node test-bots.js",
+    "test:loopserver": "BOT_FILL=0 FIRST_FREE_PLAY_SECONDS=300 DISASTER_TYPES=flood FLOOD_ZONES=F1 DISASTER_FIRST_DELAY=20 GOLDEN_AT=9999 PACKAGE_POOL=box,groceries node server.js",
+    "test:loop": "node test-loop.js",
     "build": "node --check shared.js && node --check game-server.js && node --check server.js && node --check reachability.js && node --check bots.js"
   },
   "engines": {

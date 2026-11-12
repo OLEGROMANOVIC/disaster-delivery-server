@@ -5,6 +5,8 @@
 ```text
 DisasterDelivery/
 ├── index.html          browser client (Three.js, Colyseus SDK, CrazyGames SDK v3)
+├── dd-three.js         Three.js 0.160 + GLTF/Draco/Meshopt loaders + utils, bundled into one file (client)
+├── dd-colyseus.js      Colyseus SDK 0.18.10 browser bundle (client)
 ├── shared.js           shared by client AND server: city layout, colliders, movement step, rules
 ├── server.js           server entry point (local port or Colyseus Cloud socket)
 ├── game-server.js      Colyseus 0.18 room, schemas, matchmaking, validation
@@ -14,6 +16,7 @@ DisasterDelivery/
 ├── test-milestone4.js  continuous city, jumping, knockback, props, social, Golden Package, parkour
 ├── bots.js             server-only bot couriers: navigation grid, A* pathing, behaviour
 ├── test-bots.js        bot fill / replacement / behaviour tests
+├── test-loop.js        faster loop, guided first delivery, XP / levels
 ├── reachability.js     walkability + path helper used by the M4 tests (not needed by the game)
 ├── package.json / package-lock.json
 ├── .env.example        server configuration
@@ -180,6 +183,41 @@ How they behave (`bots.js`, all server-side):
 
 Settings: `BOT_FILL` (0 turns bots off), `BOT_JOIN_DELAY` (average seconds between bots arriving), `BOTS_IN_PRIVATE=false` keeps private rooms bot-free, and `BOT_TAG=1` adds a visible 🤖 to bot names if you ever need to label them. Bots don't drive trucks yet.
 
+## Onboarding, sound, faster loop, progression
+
+**Guided first delivery** (first visit only; skippable with the link or Enter):
+- The client joins with `tutorial: true`. The server puts a personal **starter box** 1.8 m in front of the new player, owned by them and bound for one of the 3 nearest buildings. It isn't depot stock and isn't restocked.
+- The hints walk through it: walk to the green arrow → **E** to pick up → follow the beam (Shift sprint, Space jump) → **E** to deliver → a short "nice delivery" wrap-up. The game keeps running underneath.
+- Most of the HUD (info card, leaderboard, controls, delivery card, feed) stays hidden until the delivery is done.
+- Finishing (or skipping) sets `onboarded` in the profile. A player who leaves halfway sees it again next time.
+
+**Sound** (`AudioEngine` in `index.html`): everything is synthesised with WebAudio, so nothing is downloaded.
+- Effects: footsteps (yours and nearby couriers; splashy in flood water), jump and landing, pickup, load, a delivery fanfare that rises with your combo, a golden fanfare, knockback, the rush horn, countdown beeps, a results jingle, a level-up fanfare, chat pops and UI clicks.
+- Ambience by distance: tornado wind, flood water, truck engines (yours, or the nearest moving one).
+- Adaptive music: a step sequencer that is calm in free play, upbeat in the rush, faster in the last 30 s, and a soft pad during breaks.
+- **M** or the 🔊 button mutes. The CrazyGames *mute audio* setting is respected. Audio starts on the first click or key press, as browsers require.
+
+**Faster loop:**
+- On-foot packages now go to the nearest 40% of buildings: about 46 m from the depot on average, against 63 m before. Truck cargo goes further out.
+- **Combo:** deliver again within 30 s for +10% per chained delivery (up to +50%). A HUD bar shows the window.
+- **Storm bonus:** +30% for fragile cargo that was carried or loaded during an active disaster and still has ≥ 50% condition.
+- The server computes and sends the breakdown (`base`, `comboBonus`, `stormBonus`). Settings are in `SCORING` in `shared.js`.
+
+**Progression** (first layer; cosmetic, nothing affects gameplay):
+- XP comes from the server: every delivery is worth points/10. Each rush gives 40 for playing, +80/50/30 for the podium, +5 per delivery and +120 for the Golden Package. The first rush of each day counts double.
+- Levels 1–99 with titles (Rookie, Courier, Runner, Express, Storm Chaser, Road Legend, Golden Hands, Disaster Master). The HUD shows a level badge and XP bar, and the results screen shows XP gained.
+- Name tags read `Lv12 Name`. The client reports its level after a level-up and the server only accepts 1–99. Bots get plausible levels.
+- Saved with the CrazyGames **Data module** (follows a signed-in account across devices) plus local storage for guests.
+- The XP total lives on the client, so a determined player could edit it. That's fine while it's cosmetic. Coins and the garage (later milestones) should be stored on the server.
+
+**Libraries bundled:** `dd-three.js` (744 KB, ~194 KB gzipped) and `dd-colyseus.js` (222 KB, ~69 KB gzipped) sit next to `index.html`, so jsDelivr is no longer needed.
+- Still loaded from outside: the CrazyGames SDK (required to come from their CDN), Google Fonts (optional, with a system font fallback), and the Draco decoder (only fetched if a GLB is Draco-compressed).
+- `DD.loadReport()` lists everything downloaded and the total. It also prints to the console automatically at the first `gameplayStart`, which is the point CrazyGames measures the initial download up to. Without models, the code is about 1.2 MB, so the total is essentially your GLBs.
+
+**Keys:**
+- Controls use physical key positions. Hints show the player's own layout via `navigator.keyboard.getLayoutMap()` (AZERTY shows ZQSD; drop becomes the key labelled A).
+- Esc no longer does anything in the game (browsers use it to leave fullscreen). The T and G wheels close with the same key.
+
 ## Local testing
 
 ```bash
@@ -225,6 +263,9 @@ npm run test:m4                # terminal 2 (UNIT_ONLY=1 npm run test:m4 runs ju
 
 npm run test:botserver         # bots: terminal 1
 npm run test:bots              # terminal 2
+
+npm run test:loopserver        # loop / onboarding / XP: terminal 1
+npm run test:loop              # terminal 2
 ```
 
 All other test servers run with `BOT_FILL=0`, so their exact player counts hold.
@@ -267,7 +308,7 @@ npx serve .        # then open http://localhost:3000 in two windows
 
 ### Upload to CrazyGames
 
-Upload `index.html`, `shared.js` and the `.glb` files only (not `server.js`, `game-server.js` or `node_modules`). All paths are relative. During the Preview test, check the Colyseus Cloud logs for `rejected origin` lines and add any CrazyGames origin that shows up to `ALLOWED_ORIGINS`.
+Upload `index.html`, `shared.js`, `dd-three.js`, `dd-colyseus.js` and the `.glb` files only (not `server.js`, `game-server.js` or `node_modules`). All paths are relative. During the Preview test, check the Colyseus Cloud logs for `rejected origin` lines and add any CrazyGames origin that shows up to `ALLOWED_ORIGINS`.
 
 ### Scaling later
 
@@ -296,5 +337,5 @@ Not done yet:
 - Pure spectating of a *full* room (a full room is refused instead).
 - Vendoring the CDN scripts locally.
 - Mobile/touch controls (no touch jump / wheel yet).
-- Sound effects.
-- Permanent economy (coins, XP, garage) — by design, Milestones 5/6.
+- Server-persisted economy (coins, garage). XP / levels exist but are kept client-side because they are cosmetic.
+- Bots don't drive trucks.

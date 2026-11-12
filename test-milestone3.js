@@ -247,7 +247,7 @@ async function trucks() {
   const score0 = a.me.score;
   await a.walkTo(routeTo(dest, a.me), true, 60000);
   const del = await a.interact();
-  check('P11 server reward = base × (0.5 + 0.5 × condition/100)', del?.ok && a.me.score - score0 === deliveryReward(PACKAGE_TYPES.groceries.reward, 40), `${JSON.stringify(del)} score +${a.me.score - score0}`);
+  check('P11 server reward = base × (0.5 + 0.5 × condition/100)', del?.ok && del.base === deliveryReward(PACKAGE_TYPES.groceries.reward, 40) && a.me.score - score0 === del.reward, `${JSON.stringify(del)} score +${a.me.score - score0}`);
   await waitFor(() => b.s.players.get(a.room.sessionId).score === a.me.score, 2000);
   check('P12 leaderboard score synced', b.s.players.get(a.room.sessionId).score === a.me.score);
 

@@ -8,7 +8,7 @@ import jwt from 'jsonwebtoken';
 import {
   NET, GAME, CYCLE, PHASES, isBreakPhase, deliveriesAllowed, movementAllowed,
   PACKAGE_TYPES, QUICK_CHAT, EMOTE_LIST, ROOM_CODE, PROTOCOL_VERSION, DISASTER, FLOOD_ZONES, VEHICLE, CONDITION, ROADS, MAP,
-  PLAYER, KNOCKBACK, PROP_TYPES, PROPS, GOLDEN,
+  PLAYER, KNOCKBACK, PROP_TYPES, PROPS, GOLDEN, SCORING, PROGRESSION, deliveryScore, deliveryXp,
   buildLayout, createPhysicsWorld, stepMovement, stepVehicle, sanitizeMoveInput, sanitizeDriveInput, sanitizeSkin,
   distanceXZ, deliveryReward, packageDef, weightOf, floodAt, vehicleGeometry, vehicleCircles, cargoSlotsUsed,
   resolveInteraction, mulberry32, applyKnock, stepProp, separateProps, propCircles, computeRushRewards
@@ -144,6 +144,9 @@ const PlayerState = schema({
   rushScore: t.uint32().default(0),              // current / last Delivery Rush only
   rushDeliveries: t.uint16().default(0),
   rushBest: t.uint16().default(0),               // best single delivery this rush
+  combo: t.uint8().default(0),                   // chained deliveries (bonus +10 % each)
+  comboUntil: t.float64().default(0),            // server epoch ms the combo runs out
+  level: t.uint8().default(1),                   // cosmetic progression level (name tag)
   bestRush: t.uint32().default(0),               // personal best rush score this session
   busy: t.boolean().default(false),              // client is busy with a break (ad-ready hook)
   carrying: t.string().default(''),              // package id or ''
@@ -161,7 +164,8 @@ const PackageState = schema({
   destinationId: t.string().default(''),
   reward: t.uint16().default(0),                 // base points
   condition: t.uint8().default(100),
-  ownerId: t.string().default(''),               // Golden Package: the courier who claimed it
+  storm: t.boolean().default(false),             // went through an active disaster (storm bonus if fragile)
+  ownerId: t.string().default(''),               // Golden / starter package: the courier who owns it
   expiresAt: t.float64().default(0)              // Golden Package: server epoch ms it disappears
 }, 'PackageState');
 
@@ -512,6 +516,11 @@ export class CityRoom extends Room {
     this.onMessage('resetVehicle', (client) => this.safe(() => this.handleResetVehicle(client)));
     this.onMessage('emote', (client, msg) => this.safe(() => this.handleEmote(client, msg)));
     this.onMessage('chat', (client, msg) => this.safe(() => this.handleChat(client, msg)));
+    // cosmetic: the client tells us its level after a level-up (shown on its name tag)
+    this.onMessage('level', (client, msg) => this.safe(() => {
+      const p = this.state.players.get(client.sessionId), l = msg && msg.level;
+      if (p && Number.isInteger(l) && l >= 1 && l <= PROGRESSION.maxLevel) p.level = l;
+    }));
     // Break readiness (ad-ready architecture): a client busy with something during a break
     // (e.g. a future ad) may hold free play back by at most CYCLE.breakMaxExtraWaitSeconds.
     this.onMessage('busy', (client, msg) => this.safe(() => this.handleBusy(client, !!(msg && msg.busy))));
@@ -549,7 +558,8 @@ export class CityRoom extends Room {
       userId = identity.userId;
     }
     if (!name) name = this.makeGuestName();
-    return { name, verified, userId, skin };
+    const level = Number.isInteger(options.level) ? clamp(options.level, 1, PROGRESSION.maxLevel) : 1;
+    return { name, verified, userId, skin, level, tutorial: options.tutorial === true };
   }
 
   makeGuestName() {
@@ -574,7 +584,7 @@ export class CityRoom extends Room {
       && now - this.state.rushStartedAt > CONFIG.lateJoinWindowSeconds * 1000
       && realActive >= 2;
     Object.assign(p, {
-      sessionId: client.sessionId, name: auth.name, verified: !!auth.verified, skin: auth.skin || 1,
+      sessionId: client.sessionId, name: auth.name, verified: !!auth.verified, skin: auth.skin || 1, level: auth.level || 1,
       role: lateJoin ? 'spectator' : 'active', connected: true, slot: this.freeSlot()
     });
     const sim = this.createSim(p.slot);
@@ -583,6 +593,7 @@ export class CityRoom extends Room {
     this.state.players.set(client.sessionId, p);
     this.updateCounts();
     this.balanceBots(now);
+    if (auth.tutorial && p.role === 'active') this.spawnStarter(p, sim, now);
     console.log(`[room ${this.roomId}] ${p.name} joined as ${p.role} (${this.realCount()} real + ${this.bots.size} bots)`);
   }
 
@@ -619,7 +630,11 @@ export class CityRoom extends Room {
     const sim = this.sims.get(sid);
     if (p?.driving) this.releaseVehicle(p, sim, false);
     if (p?.carrying && sim) this.dropPackage(p, sim, 0);   // package stays in the world
-    for (const pkg of this.state.packages.values()) if (pkg.ownerId === sid) pkg.ownerId = '';   // golden is free again
+    for (const pkg of [...this.state.packages.values()]) {
+      if (pkg.ownerId !== sid) continue;
+      if (pkg.type === 'starter') this.expireGolden(pkg, 'left');     // their personal starter box goes too
+      else pkg.ownerId = '';                                          // golden is free again
+    }
     this.state.players.delete(sid);
     this.sims.delete(sid);
     this.updateCounts();
@@ -716,6 +731,7 @@ export class CityRoom extends Room {
     const p = new PlayerState();
     Object.assign(p, {
       sessionId: sid, name: (CONFIG.botTag ? '🤖 ' : '') + makeBotName(taken), verified: false, skin: Math.random() < 0.5 ? 1 : 2,
+      level: Math.round(2 + 33 * Math.random() ** 1.8),                // most players are low level, a few veterans
       role: 'active', connected: true, slot: this.freeSlot()
     });
     const sim = this.createSim(p.slot);
@@ -806,7 +822,7 @@ export class CityRoom extends Room {
   removePackage(id, respawn, delaySeconds = GAME.packageRespawnSeconds) {
     const pkg = this.state.packages.get(id);
     if (!pkg) return;
-    if (packageDef(pkg.type).golden) respawn = false;      // the Golden Package is never restocked
+    if (packageDef(pkg.type).golden || pkg.type === 'starter') respawn = false;      // specials are never restocked
     this.state.packages.delete(id);
     this.cond.delete(id);
     this.groundInfo.delete(id);
@@ -937,22 +953,29 @@ export class CityRoom extends Room {
       case 'deliver':
       case 'deliverFromTruck': {
         if (!deliveriesAllowed(s.phase)) { reply(false, { reason: 'breakNoDeliveries' }); return; }
-        const reward = deliveryReward(pkg.reward, pkg.condition);
-        if (reward <= 0) { reply(false, { reason: 'broken' }); return; }
+        if (deliveryReward(pkg.reward, pkg.condition) <= 0) { reply(false, { reason: 'broken' }); return; }
         if (act.kind === 'deliver') p.carrying = '';
         else { const i = v.cargo.indexOf(pkg.id); if (i >= 0) v.cargo.splice(i, 1); }
         const rush = s.phase === PHASES.RUSH;
+        // combo: deliver again within the window to grow it
+        const combo = now < p.comboUntil ? Math.min(p.combo + 1, SCORING.comboMax) : 0;
+        const sc = deliveryScore(pkg.reward, pkg.condition, combo, pkg.storm && packageDef(pkg.type).fragile);
+        p.combo = combo; p.comboUntil = now + SCORING.comboWindowSeconds * 1000;
+        const reward = sc.total;
         this.awardDelivery(p, reward, rush);
         const condition = pkg.condition, type = pkg.type, golden = !!packageDef(type).golden;
         const dest = s.destinations.get(pkg.destinationId);
         this.removePackage(pkg.id, !golden);
-        reply(true, { reward, type, condition, rush });
-        this.broadcast('feed', { kind: 'delivered', sid, name: p.name, reward, type, condition, rush, x: dest?.x ?? sim.position.x, z: dest?.z ?? sim.position.z });
+        const xp = deliveryXp(reward);
+        reply(true, { reward, base: sc.reward, combo, comboBonus: sc.comboBonus, stormBonus: sc.stormBonus, xp, type, condition, rush });
+        if (!this.bots.has(sid)) client.send('xp', { amount: xp, reason: 'delivery' });
+        this.broadcast('feed', { kind: 'delivered', sid, name: p.name, reward, combo, storm: sc.stormBonus > 0, type, condition, rush, x: dest?.x ?? sim.position.x, z: dest?.z ?? sim.position.z });
         if (golden) { this.goldenWinner = sid; this.broadcast('golden', { phase: 'delivered', name: p.name, sid, reward }); }
         return;
       }
       case 'pickup': {
         const golden = !!packageDef(pkg.type).golden;
+        if (pkg.type === 'starter' && pkg.ownerId !== sid) { reply(false, { reason: 'goldenTaken' }); return; }
         if (golden && pkg.ownerId && pkg.ownerId !== sid) { reply(false, { reason: 'goldenTaken' }); return; }
         Object.assign(pkg, { status: 'carried', carrierId: sid, vehicleId: '', slot: -1 });
         this.groundInfo.delete(pkg.id);
@@ -1187,6 +1210,27 @@ export class CityRoom extends Room {
      here (server-side only). For now it only computes a preview and nothing is stored. */
   onRushRewards(results) {
     this.lastRewardPreview = computeRushRewards([...results].map(r => ({ sessionId: r.sessionId, score: r.score, rank: r.rank, deliveries: r.deliveries, golden: r.golden })));
+    for (const r of this.lastRewardPreview) {
+      if (this.bots.has(r.sessionId)) continue;
+      this.clients.find(c => c.sessionId === r.sessionId)?.send('xp', { amount: r.xp, reason: 'rush', parts: r.parts, rushNumber: this.state.rushNumber });
+    }
+  }
+
+  /* Guided first delivery: a personal box right in front of a new player, for a nearby building. */
+  spawnStarter(p, sim, now) {
+    const s = this.state;
+    const fx = Math.sin(sim.rotationY), fz = Math.cos(sim.rotationY);
+    const x = sim.position.x + fx * 1.8, z = sim.position.z + fz * 1.8;
+    const near = [...LAYOUT.buildings].sort((a, b) => Math.hypot(a.doorX - x, a.doorZ - z) - Math.hypot(b.doorX - x, b.doorZ - z)).slice(0, 3);
+    const dest = near[Math.floor(Math.random() * near.length)];
+    const pkg = new PackageState();
+    const id = `S${++this.packageCounter}`;
+    Object.assign(pkg, {
+      id, type: 'starter', status: 'available', carrierId: '', vehicleId: '', slot: -1, x, z, y: WORLD.groundHeight(x, z),
+      destinationId: dest.id, reward: PACKAGE_TYPES.starter.reward, condition: 100, ownerId: p.sessionId, expiresAt: now + 150 * 1000
+    });
+    this.cond.set(id, 100);
+    s.packages.set(id, pkg);
   }
 
   /* ---------------- Golden Package ---------------- */
@@ -1232,15 +1276,23 @@ export class CityRoom extends Room {
     return -1;
   }
 
-  depotStock() { let n = 0; for (const p of this.state.packages.values()) if (p.type !== 'golden') n++; return n; }
+  depotStock() { let n = 0; for (const p of this.state.packages.values()) if (p.type !== 'golden' && p.type !== 'starter') n++; return n; }
   spawnPackage() {
     if (this.depotStock() >= GAME.maxPackages) return false;
     const slot = this.freePadSlot();
     if (slot < 0) return false;
     const destInUse = new Set([...this.state.packages.values()].map(p => p.destinationId));
     const type = this.pickPackageType();
-    const candidates = LAYOUT.buildings.filter(b => !destInUse.has(b.id));
-    const pool = candidates.length ? candidates : LAYOUT.buildings;
+    // shorter trips keep the loop snappy: on-foot packages go to the nearest buildings of the whole city
+    // (skipping ones already in use), truck cargo further out
+    const D = LAYOUT.depot;
+    const byDist = [...LAYOUT.buildings].sort((a, b) => Math.hypot(a.doorX - D.cx, a.doorZ - D.cz) - Math.hypot(b.doorX - D.cx, b.doorZ - D.cz));
+    const cut = Math.max(1, Math.round(byDist.length * SCORING.nearShare));
+    const w = weightOf(type);
+    const band = w.onFoot && w.slots < 2 ? byDist.slice(0, cut) : byDist.slice(Math.max(0, cut - 3));
+    let pool = band.filter(b => !destInUse.has(b.id));
+    if (!pool.length) pool = byDist.filter(b => !destInUse.has(b.id)).slice(0, 4);
+    if (!pool.length) pool = band;
     const dest = pool[Math.floor(Math.random() * pool.length)];
     const pkg = new PackageState();
     const sp = LAYOUT.packageSlots[slot];
@@ -1337,7 +1389,7 @@ export class CityRoom extends Room {
       }
       // packages left lying around return to a free depot pad (the Golden Package stays put)
       const info = this.groundInfo.get(pkg.id);
-      if (pkg.type === 'golden') continue;
+      if (pkg.type === 'golden' || pkg.type === 'starter') continue;
       if (pkg.slot < 0 && info && now - info.since > CONDITION.groundReturnSeconds * 1000) {
         const slot = this.freePadSlot();
         if (slot >= 0) {
@@ -1433,7 +1485,7 @@ export class CityRoom extends Room {
     const s = this.state;
     if (s.phase === PHASES.RUSH && now >= this.goldenAt) { this.goldenAt = Infinity; this.spawnGolden(now); }
     for (const pkg of s.packages.values()) {
-      if (pkg.type === 'golden' && pkg.expiresAt && now >= pkg.expiresAt) { this.expireGolden(pkg, 'expired'); break; }
+      if ((pkg.type === 'golden' || pkg.type === 'starter') && pkg.expiresAt && now >= pkg.expiresAt) { this.expireGolden(pkg, pkg.type === 'golden' ? 'expired' : 'starter'); break; }
     }
   }
 
@@ -1502,6 +1554,12 @@ export class CityRoom extends Room {
     for (const [id, vs] of this.vsims) this.writeVehicle(s.vehicles.get(id), vs);   // parked/dropped trucks too
 
     if (hazards) this.truckHits(now);
+    // cargo that goes through an active disaster earns the storm bonus (if it arrives in good shape)
+    const d = s.disaster;
+    if (hazards && d.phase === 'active' && d.level > 0.3) {
+      for (const pkg of s.packages.values()) if (!pkg.storm && (pkg.status === 'carried' || pkg.status === 'loaded')) pkg.storm = true;
+    }
+    for (const p of s.players.values()) if (p.combo && now > p.comboUntil) p.combo = 0;
     this.stepProps(now);
     this.updateGolden(now);
 

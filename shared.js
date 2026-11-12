@@ -78,8 +78,53 @@ export const PACKAGE_TYPES = {
   piano:     { label: 'Piano',        model: 'piano',        reward: 900,  weight: 'veryheavy', fragile: true,  waterSensitive: true,  spawnWeight: 7 },
   vip:       { label: 'VIP box',      model: 'vipbox',       reward: 1200, weight: 'medium',    fragile: true,  waterSensitive: true,  spawnWeight: 4 },
   // Delivery Rush special (never spawns at the depot): see GOLDEN
-  golden:    { label: 'Golden Package', model: 'vipbox',     reward: 2000, weight: 'light',     fragile: true,  waterSensitive: false, spawnWeight: 0, golden: true }
+  golden:    { label: 'Golden Package', model: 'vipbox',     reward: 2000, weight: 'light',     fragile: true,  waterSensitive: false, spawnWeight: 0, golden: true },
+  // a new player's guided first delivery: placed right in front of them, only they can take it
+  starter:   { label: 'Starter box',    model: 'box',        reward: 100,  weight: 'light',     fragile: false, waterSensitive: false, spawnWeight: 0, starter: true }
 };
+/* SCORING — chain deliveries for a combo, keep fragile cargo safe through a disaster for a storm bonus.
+   total = reward (condition-based) + combo bonus + storm bonus */
+export const SCORING = {
+  comboWindowSeconds: 30,       // deliver again within this time to grow the combo
+  comboStep: 0.1, comboMax: 5,  // +10 % per chained delivery, up to +50 %
+  stormBonus: 0.3,              // +30 % for fragile cargo that went through an active disaster…
+  stormMinCondition: 50,        // …and still arrived in decent shape
+  nearShare: 0.4                // on-foot packages go to the nearest 40 % of buildings (~46 m vs 63 m on average); heavy ones further out
+};
+export function deliveryScore(base, condition, combo, storm) {
+  const reward = deliveryReward(base, condition);
+  const comboBonus = reward > 0 ? Math.round(reward * SCORING.comboStep * Math.min(combo, SCORING.comboMax)) : 0;
+  const stormBonus = reward > 0 && storm && condition >= SCORING.stormMinCondition ? Math.round(reward * SCORING.stormBonus) : 0;
+  return { reward, comboBonus, stormBonus, total: reward + comboBonus + stormBonus };
+}
+
+/* PROGRESSION — XP and levels. The server decides how much XP is earned; the client keeps the
+   total (CrazyGames Data module for signed-in players, local storage for guests). Cosmetic only:
+   a level + title on your name tag, nothing that changes gameplay. */
+export const PROGRESSION = {
+  maxLevel: 99,
+  xpPerDeliveryDivisor: 10,                 // delivery XP = points / 10
+  rush: { participation: 40, rank: [80, 50, 30], golden: 120, perDelivery: 5 },
+  dailyFirstRushMultiplier: 2,              // the first rush you finish each day gives double rush XP
+  titles: [[1, 'Rookie'], [3, 'Courier'], [6, 'Runner'], [10, 'Express'], [15, 'Storm Chaser'], [20, 'Road Legend'], [30, 'Golden Hands'], [45, 'Disaster Master']]
+};
+/* XP needed to go from `level` to level + 1 */
+export function xpToNext(level) { return Math.round(120 + 60 * (level - 1) + 8 * (level - 1) ** 1.6); }
+export function levelFromXp(xp) {
+  let level = 1, left = Math.max(0, Math.floor(xp) || 0);
+  while (level < PROGRESSION.maxLevel && left >= xpToNext(level)) { left -= xpToNext(level); level++; }
+  return { level, into: left, need: level < PROGRESSION.maxLevel ? xpToNext(level) : 0 };
+}
+export function titleFor(level) { let t = PROGRESSION.titles[0][1]; for (const [l, name] of PROGRESSION.titles) if (level >= l) t = name; return t; }
+export function deliveryXp(points) { return Math.max(1, Math.round(points / PROGRESSION.xpPerDeliveryDivisor)); }
+export function rushXp(entry) {
+  const R = PROGRESSION.rush;
+  const parts = [['Rush played', R.participation]];
+  if (entry.score > 0 && entry.rank >= 1 && entry.rank <= 3) parts.push([`#${entry.rank} place`, R.rank[entry.rank - 1]]);
+  if (entry.deliveries > 0) parts.push([`${entry.deliveries} deliveries`, entry.deliveries * R.perDelivery]);
+  if (entry.golden) parts.push(['Golden Package', R.golden]);
+  return { xp: parts.reduce((a, [, v]) => a + v, 0), parts };
+}
 /* GOLDEN PACKAGE — at most one per Delivery Rush, somewhere in the city (not the depot).
    The first courier to pick it up owns it (nobody else can take it, even if dropped);
    it must be carried on foot and disappears if not delivered in time. */
@@ -943,5 +988,6 @@ export function resolveInteraction(ctx) {
    entries: [{ sessionId, score, rank, deliveries, golden }]
    ===================================================================== */
 export function computeRushRewards(entries) {
-  return entries.map(e => ({ sessionId: e.sessionId, points: e.score, placement: e.rank, golden: !!e.golden, granted: false }));
+  // XP is granted (the client stores it); coins / garage come later and will be server-persisted
+  return entries.map(e => ({ sessionId: e.sessionId, points: e.score, placement: e.rank, golden: !!e.golden, ...rushXp(e), granted: false }));
 }
