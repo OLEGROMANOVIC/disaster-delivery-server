@@ -6,10 +6,12 @@ import { defineServer, defineRoom, Room, ServerError, matchMaker, CloseCode, Loc
 import { schema, t } from '@colyseus/schema';
 import jwt from 'jsonwebtoken';
 import {
-  NET, GAME, PACKAGE_TYPES, EMOTES, ROOM_CODE, PROTOCOL_VERSION, DISASTER, FLOOD_ZONES, VEHICLE, CONDITION, ROADS, MAP,
+  NET, GAME, CYCLE, PHASES, isBreakPhase, deliveriesAllowed, movementAllowed,
+  PACKAGE_TYPES, QUICK_CHAT, EMOTE_LIST, ROOM_CODE, PROTOCOL_VERSION, DISASTER, FLOOD_ZONES, VEHICLE, CONDITION, ROADS, MAP,
+  PLAYER, KNOCKBACK, PROP_TYPES, PROPS, GOLDEN,
   buildLayout, createPhysicsWorld, stepMovement, stepVehicle, sanitizeMoveInput, sanitizeDriveInput, sanitizeSkin,
   distanceXZ, deliveryReward, packageDef, weightOf, floodAt, vehicleGeometry, vehicleCircles, cargoSlotsUsed,
-  resolveInteraction, mulberry32
+  resolveInteraction, mulberry32, applyKnock, stepProp, separateProps, propCircles, computeRushRewards
 } from './shared.js';
 
 /* ---------------------------------------------------------------------
@@ -25,8 +27,14 @@ const CONFIG = {
   // Empty Origin = non-browser clients (tests). Off by default in production / on Colyseus Cloud.
   allowEmptyOrigin: env.ALLOW_EMPTY_ORIGIN !== undefined ? env.ALLOW_EMPTY_ORIGIN === 'true'
     : (env.NODE_ENV !== 'production' && env.COLYSEUS_CLOUD === undefined),
-  matchSeconds: num(env.MATCH_SECONDS, GAME.matchSeconds),
-  intermissionSeconds: num(env.INTERMISSION_SECONDS, GAME.intermissionSeconds),
+  // Continuous-city cycle (seconds). MATCH_SECONDS is accepted as an alias for RUSH_SECONDS.
+  firstFreePlaySeconds: num(env.FIRST_FREE_PLAY_SECONDS, CYCLE.firstFreePlaySeconds),
+  freePlaySeconds: num(env.FREE_PLAY_SECONDS, CYCLE.freePlaySeconds),
+  rushWarningSeconds: num(env.RUSH_WARNING_SECONDS, CYCLE.rushWarningSeconds),
+  rushSeconds: num(env.RUSH_SECONDS, num(env.MATCH_SECONDS, CYCLE.rushSeconds)),
+  resultsSeconds: num(env.RESULTS_SECONDS, CYCLE.resultsSeconds),
+  intermissionSeconds: num(env.INTERMISSION_SECONDS, CYCLE.intermissionSeconds),
+  breakMaxExtraWaitSeconds: num(env.BREAK_MAX_EXTRA_WAIT_SECONDS, CYCLE.breakMaxExtraWaitSeconds),
   lateJoinWindowSeconds: num(env.LATE_JOIN_SECONDS, GAME.lateJoinWindowSeconds),
   reconnectSeconds: num(env.RECONNECT_SECONDS, GAME.reconnectSeconds),
   crazyGamesKeyUrl: env.CRAZYGAMES_PUBLIC_KEY_URL || 'https://sdk.crazygames.com/publicKey.json',
@@ -35,7 +43,16 @@ const CONFIG = {
   disasterTypes: (env.DISASTER_TYPES || DISASTER.types.join(',')).split(',').map(s => s.trim()).filter(t => DISASTER.types.includes(t)),
   forcedFloodZones: (env.FLOOD_ZONES || '').split(',').map(s => s.trim()).filter(id => FLOOD_ZONES.some(z => z.id === id)),
   tornadoPath: (env.TORNADO_PATH || '').split(';').map(p => p.split(',').map(Number)).filter(p => p.length === 2 && p.every(Number.isFinite)),
-  packagePool: (env.PACKAGE_POOL || '').split(',').map(s => s.trim()).filter(k => PACKAGE_TYPES[k])
+  packagePool: (env.PACKAGE_POOL || '').split(',').map(s => s.trim()).filter(k => PACKAGE_TYPES[k]),
+  disasterFirstDelay: num(env.DISASTER_FIRST_DELAY, DISASTER.rolling.firstDelaySeconds),
+  disasterGap: env.DISASTER_GAP !== undefined && env.DISASTER_GAP !== '' ? num(env.DISASTER_GAP, null) : null,
+  disasterWarn: num(env.DISASTER_WARN, DISASTER.rolling.warnSeconds),
+  disasterActive: env.DISASTER_ACTIVE !== undefined && env.DISASTER_ACTIVE !== '' ? num(env.DISASTER_ACTIVE, null) : null,
+  // Golden Package test hooks: GOLDEN_AT = seconds into the rush (overrides the random window), GOLDEN_SPOT = index
+  goldenAt: env.GOLDEN_AT !== undefined && env.GOLDEN_AT !== '' ? num(env.GOLDEN_AT, null) : null,
+  goldenSpot: env.GOLDEN_SPOT !== undefined && env.GOLDEN_SPOT !== '' ? num(env.GOLDEN_SPOT, null) : null,
+  goldenLifetime: num(env.GOLDEN_LIFETIME, GOLDEN.lifetimeSeconds),
+  propResetSeconds: num(env.PROP_RESET_SECONDS, PROPS.resetIdleSeconds)
 };
 if (env.DROP_DAMAGE !== undefined && Number.isFinite(Number(env.DROP_DAMAGE))) CONDITION.dropDamage = Number(env.DROP_DAMAGE);
 
@@ -106,12 +123,22 @@ const PlayerState = schema({
   x: t.float32().default(0), y: t.float32().default(0), z: t.float32().default(0),
   rotY: t.float32().default(0),
   vx: t.float32().default(0), vz: t.float32().default(0),
-  ix: t.float32().default(0), iz: t.float32().default(0),   // external impulse (tornado), replayed by prediction
+  ix: t.float32().default(0), iz: t.float32().default(0),   // external impulse (tornado / knockback), replayed by prediction
+  vy: t.float32().default(0),                    // vertical speed (jumps, launches)
+  air: t.boolean().default(false),               // airborne
+  stun: t.float32().default(0),                  // seconds of knockback stun left (no control)
   moving: t.boolean().default(false),
-  anim: t.string().default('idle'),              // 'run' | 'idle'
+  anim: t.string().default('idle'),              // 'run' | 'idle' | 'air' | 'stun' | 'emote'
+  emote: t.string().default(''),                 // EMOTE_LIST id while performing a gesture
+  emoteAt: t.float64().default(0),               // server epoch ms the gesture started
   ack: t.uint32().default(0),                    // last processed input sequence (client reconciliation)
-  score: t.uint32().default(0),
+  score: t.uint32().default(0),                  // session total (free play + every rush) — not persisted
   deliveries: t.uint16().default(0),
+  rushScore: t.uint32().default(0),              // current / last Delivery Rush only
+  rushDeliveries: t.uint16().default(0),
+  rushBest: t.uint16().default(0),               // best single delivery this rush
+  bestRush: t.uint32().default(0),               // personal best rush score this session
+  busy: t.boolean().default(false),              // client is busy with a break (ad-ready hook)
   carrying: t.string().default(''),              // package id or ''
   driving: t.string().default('')                // vehicle id or ''
 }, 'PlayerState');
@@ -126,8 +153,18 @@ const PackageState = schema({
   x: t.float32().default(0), y: t.float32().default(0), z: t.float32().default(0),
   destinationId: t.string().default(''),
   reward: t.uint16().default(0),                 // base points
-  condition: t.uint8().default(100)
+  condition: t.uint8().default(100),
+  ownerId: t.string().default(''),               // Golden Package: the courier who claimed it
+  expiresAt: t.float64().default(0)              // Golden Package: server epoch ms it disappears
 }, 'PackageState');
+
+const PropState = schema({
+  id: t.string().default(''),
+  kind: t.string().default(''),                  // PROP_TYPES key (GLB name)
+  x: t.float32().default(0), z: t.float32().default(0),
+  yaw: t.float32().default(0),
+  moving: t.boolean().default(false)
+}, 'PropState');
 
 const DestinationState = schema({
   id: t.string().default(''),
@@ -173,6 +210,10 @@ const ResultEntry = schema({
   name: t.string().default(''),
   score: t.uint32().default(0),
   deliveries: t.uint16().default(0),
+  bestDelivery: t.uint16().default(0),
+  personalBest: t.boolean().default(false),      // beat their previous best this session
+  golden: t.boolean().default(false),            // delivered the Golden Package
+  skin: t.uint8().default(1),
   rank: t.uint8().default(0)
 }, 'ResultEntry');
 
@@ -181,12 +222,14 @@ const CityState = schema({
   roomCode: t.string().default(''),
   region: t.string().default(''),
   mode: t.string().default(''),                  // 'public' | 'private'
-  phase: t.string().default('playing'),          // 'playing' | 'results'
-  matchNumber: t.uint16().default(0),
-  matchStartedAt: t.float64().default(0),
-  matchEndsAt: t.float64().default(0),
+  phase: t.string().default('free_play'),        // free_play | rush_warning | delivery_rush | results | intermission
+  rushNumber: t.uint16().default(0),             // Delivery Rush events held in this room so far
+  phaseStartedAt: t.float64().default(0),        // server epoch ms
   phaseEndsAt: t.float64().default(0),
-  timeLeft: t.uint16().default(0),
+  rushStartedAt: t.float64().default(0),
+  rushEndsAt: t.float64().default(0),
+  nextRushAt: t.float64().default(0),            // when the next rush begins (free play / warning)
+  timeLeft: t.uint16().default(0),               // seconds until the phase changes
   maxPlayers: t.uint8().default(0),
   playerCount: t.uint8().default(0),
   activeCount: t.uint8().default(0),
@@ -195,6 +238,7 @@ const CityState = schema({
   packages: t.map(PackageState),
   destinations: t.map(DestinationState),
   vehicles: t.map(VehicleState),
+  props: t.map(PropState),
   disaster: t.ref(DisasterState),
   results: t.array(ResultEntry)
 }, 'CityState');
@@ -202,7 +246,7 @@ const CityState = schema({
 /* Deterministic city shared with the client. */
 const LAYOUT = buildLayout();
 const WORLD = createPhysicsWorld(LAYOUT);
-const ZERO_WALK = { mx: 0, mz: 0, sp: false };
+const ZERO_WALK = { mx: 0, mz: 0, sp: false, jp: false };
 const ZERO_DRIVE = { steer: 0, throttle: 0, brake: true };
 const DT = NET.fixedDt;
 
@@ -233,25 +277,23 @@ class DisasterController {
   constructor(room) {
     this.room = room;
     this.d = room.state.disaster;
-    this.plan = [];
-    this.current = -1;
+    this.event = null;                 // { type, warnAt, startAt, endAt, doneAt }
     this.phase = 'inactive';
+    this.nextAt = Infinity;
+    this.count = 0;
+    this.lastType = null;
     this.path = []; this.pathIndex = 0;
     this.rng = Math.random;
   }
-  /* New match: fresh schedule, everything back to normal. */
-  reset(matchStartedAt) {
-    this.matchStartedAt = matchStartedAt;
-    const scale = CONFIG.matchSeconds / DISASTER.baseMatchSeconds;
-    const types = CONFIG.disasterTypes;
-    let last = null;
-    this.plan = types.length ? DISASTER.schedule.map(slot => {
-      const pool = types.length > 1 ? types.filter(t => t !== last) : types;
-      const type = pool[Math.floor(this.rng() * pool.length)];
-      last = type;
-      return { type, warn: slot.warn * scale, start: slot.start * scale, end: slot.end * scale, recover: DISASTER.recoverySeconds * Math.min(1, scale * 1.5) };
-    }) : [];
-    this.current = -1;
+  /* (Re)start the rolling schedule: first event after `delaySeconds`. */
+  schedule(now, delaySeconds) {
+    this.stop();
+    this.nextAt = now + delaySeconds * 1000;
+  }
+  /* Breaks: everything back to normal, nothing scheduled until schedule() is called again. */
+  stop() {
+    this.event = null;
+    this.nextAt = Infinity;
     this.clear();
   }
   clear() {
@@ -270,54 +312,64 @@ class DisasterController {
   }
   get tornadoActive() { return this.d.type === 'tornado' && this.d.phase === 'active' && this.d.level > 0.3; }
 
-  update(now) {
-    const elapsed = (now - this.matchStartedAt) / 1000;
-    let slot = -1, phase = 'inactive';
-    for (let i = 0; i < this.plan.length; i++) {
-      const p = this.plan[i];
-      if (elapsed >= p.warn && elapsed < p.end + p.recover) {
-        slot = i;
-        phase = elapsed < p.start ? 'warning' : elapsed < p.end ? 'active' : 'recovery';
-        break;
-      }
+  gapFor(roomPhase) {
+    if (CONFIG.disasterGap !== null) return CONFIG.disasterGap;
+    return DISASTER.rolling.gapSeconds[roomPhase] ?? 30;
+  }
+  activeFor(type) {
+    if (CONFIG.disasterActive !== null) return CONFIG.disasterActive;
+    return DISASTER.rolling.activeSeconds[type] ?? 30;
+  }
+
+  /* roomPhase: current room phase; rushEndsAt: end of the running rush (events never spill into results). */
+  update(now, roomPhase, rushEndsAt) {
+    const types = CONFIG.disasterTypes;
+    if (!this.event) {
+      if (!types.length || now < this.nextAt) return;
+      const pool = types.length > 1 ? types.filter(t => t !== this.lastType) : types;
+      const type = pool[Math.floor(this.rng() * pool.length)];
+      const warn = CONFIG.disasterWarn, active = this.activeFor(type), recover = DISASTER.recoverySeconds;
+      const total = (warn + active + recover) * 1000;
+      if (roomPhase === PHASES.RUSH && now + total > rushEndsAt) { this.nextAt = Infinity; return; }  // not enough rush left
+      this.lastType = type;
+      this.count += 1;
+      this.event = { type, warnAt: now, startAt: now + warn * 1000, endAt: now + (warn + active) * 1000, doneAt: now + total };
     }
+    const e = this.event;
+    if (now >= e.doneAt) {
+      this.event = null;
+      this.clear();
+      this.nextAt = now + this.gapFor(roomPhase) * 1000;
+      return;
+    }
+    const phase = now < e.startAt ? 'warning' : now < e.endAt ? 'active' : 'recovery';
+    if (phase !== this.phase) this.enter(phase);
     const d = this.d;
-    if (slot !== this.current || phase !== this.phase) this.enter(slot, phase, now);
-    if (slot < 0) return;
-    const p = this.plan[slot];
-    const toNext = phase === 'warning' ? p.start - elapsed : phase === 'active' ? p.end - elapsed : p.end + p.recover - elapsed;
-    const secs = Math.max(0, Math.ceil(toNext));
+    const toNext = phase === 'warning' ? e.startAt - now : phase === 'active' ? e.endAt - now : e.doneAt - now;
+    const secs = Math.max(0, Math.ceil(toNext / 1000));
     if (d.secondsLeft !== secs) d.secondsLeft = secs;
 
     // intensity: rises at the start of ACTIVE, falls during RECOVERY
     let level = 0;
-    if (phase === 'active') level = clamp((elapsed - p.start) / (d.type === 'flood' ? DISASTER.flood.riseSeconds : 2), 0, 1);
-    else if (phase === 'recovery') level = clamp(1 - (elapsed - p.end) / p.recover, 0, 1);
+    if (phase === 'active') level = clamp((now - e.startAt) / 1000 / (d.type === 'flood' ? DISASTER.flood.riseSeconds : 2), 0, 1);
+    else if (phase === 'recovery') level = clamp(1 - (now - e.endAt) / (e.doneAt - e.endAt), 0, 1);
     level = Math.round(level * 100) / 100;
     if (d.level !== level) d.level = level;
 
     if (d.type === 'tornado' && (phase === 'active' || phase === 'recovery')) this.moveTornado(DT);
   }
 
-  enter(slot, phase, now) {
-    const d = this.d;
-    const prevSlot = this.current;
-    this.current = slot; this.phase = phase;
-    if (slot < 0) { this.clear(); return; }
-    const p = this.plan[slot];
-    if (slot !== prevSlot) { this.clear(); this.current = slot; this.phase = phase; }
-    d.slot = slot; d.type = p.type; d.phase = phase;
-    d.startsAt = this.matchStartedAt + p.start * 1000;
-    d.endsAt = this.matchStartedAt + p.end * 1000;
-    if (phase === 'warning') {
-      this.room.broadcast('disaster', { phase, type: p.type });
-    } else if (phase === 'active') {
-      if (p.type === 'tornado') this.spawnTornado(p);
-      if (p.type === 'flood') this.spawnFlood();
-      this.room.broadcast('disaster', { phase, type: p.type });
-    } else if (phase === 'recovery') {
-      this.room.broadcast('disaster', { phase, type: p.type });
+  enter(phase) {
+    const d = this.d, e = this.event;
+    if (this.phase === 'inactive') { this.clear(); }
+    this.phase = phase;
+    d.slot = this.count % 100; d.type = e.type; d.phase = phase;
+    d.startsAt = e.startAt; d.endsAt = e.endAt;
+    if (phase === 'active') {
+      if (e.type === 'tornado') this.spawnTornado(e);
+      if (e.type === 'flood') this.spawnFlood();
     }
+    this.room.broadcast('disaster', { phase, type: e.type });
   }
 
   spawnTornado(p) {
@@ -329,7 +381,7 @@ class DisasterController {
       // random walk along the road grid, starting on the ring far from the depot
       const ring = NODES.filter(([x, z]) => Math.abs(x) === 75 || Math.abs(z) === 75);
       let cur = ring[Math.floor(this.rng() * ring.length)], prev = null;
-      const need = T.speed * (p.end - p.start + p.recover) + 60;
+      const need = T.speed * (p.doneAt - p.startAt) / 1000 + 60;
       this.path = [cur];
       let len = 0;
       while (len < need && this.path.length < 64) {
@@ -426,6 +478,15 @@ export class CityRoom extends Room {
       this.vsims.set(sp.id, { x: sp.x, z: sp.z, yaw: sp.yaw, speed: 0, spawn: sp, lastReset: 0, idleSince: Date.now() });
     }
 
+    this.psims = new Map();            // propId -> { kind, x, z, yaw, vx, vz, home, lastActive }
+    for (const pr of LAYOUT.props) {
+      const st = new PropState();
+      Object.assign(st, { id: pr.id, kind: pr.kind, x: pr.x, z: pr.z, yaw: pr.rotY });
+      this.state.props.set(pr.id, st);
+      this.psims.set(pr.id, { kind: pr.kind, x: pr.x, z: pr.z, yaw: pr.rotY, vx: 0, vz: 0, home: pr, lastActive: Date.now(), pusher: '' });
+    }
+    this.goldenAt = Infinity; this.goldenWinner = '';
+
     if (mode === 'private') await this.setPrivate(true);
     await this.setMetadata({ mode, region: CONFIG.region, code });
 
@@ -434,10 +495,15 @@ export class CityRoom extends Room {
     this.onMessage('drop', (client) => this.safe(() => this.handleDrop(client)));
     this.onMessage('resetVehicle', (client) => this.safe(() => this.handleResetVehicle(client)));
     this.onMessage('emote', (client, msg) => this.safe(() => this.handleEmote(client, msg)));
+    this.onMessage('chat', (client, msg) => this.safe(() => this.handleChat(client, msg)));
+    // Break readiness (ad-ready architecture): a client busy with something during a break
+    // (e.g. a future ad) may hold free play back by at most CYCLE.breakMaxExtraWaitSeconds.
+    this.onMessage('busy', (client, msg) => this.safe(() => this.handleBusy(client, !!(msg && msg.busy))));
+    this.onMessage('breakReady', (client) => this.safe(() => this.handleBusy(client, false)));
     this.onMessage('*', () => { /* unknown message types are ignored */ });
 
     this.setTimestep(() => this.safe(() => this.tick()), 1000 / NET.tickRate);
-    this.startMatch();
+    this.openCity();
     console.log(`[room ${code}] created (${mode}, region ${CONFIG.region})`);
   }
 
@@ -483,10 +549,10 @@ export class CityRoom extends Room {
     const auth = client.auth || {};
     const now = Date.now();
     const p = new PlayerState();
-    // Late-join policy: spectate until the next round once the match is under way,
-    // unless the room has fewer than 2 active couriers (e.g. a host waiting for friends).
-    const lateJoin = this.state.phase === 'playing'
-      && now - this.state.matchStartedAt > CONFIG.lateJoinWindowSeconds * 1000
+    // Late-join policy: only a Delivery Rush that is well under way makes newcomers spectate
+    // until it ends (unless fewer than 2 couriers are active). Free play / breaks: join at once.
+    const lateJoin = this.state.phase === PHASES.RUSH
+      && now - this.state.rushStartedAt > CONFIG.lateJoinWindowSeconds * 1000
       && this.state.activeCount >= 2;
     Object.assign(p, {
       sessionId: client.sessionId, name: auth.name, verified: !!auth.verified, skin: auth.skin || 1,
@@ -504,7 +570,12 @@ export class CityRoom extends Room {
     const p = this.state.players.get(client.sessionId);
     if (p) p.connected = false;
     const sim = this.sims.get(client.sessionId);
-    if (sim) { sim.queue.length = 0; sim.velocity.x = sim.velocity.z = 0; sim.moving = false; }
+    if (sim) {
+      sim.queue.length = 0; sim.velocity.x = sim.velocity.z = 0; sim.moving = false;
+      // no inputs arrive while dropped, so land an airborne courier instead of leaving them hanging
+      if (sim.air) { sim.position.y = WORLD.supportHeight(sim.position.x, sim.position.z, sim.position.y); sim.air = false; sim.vy = 0; }
+      sim.stun = 0; sim.impulse.x = sim.impulse.z = 0;
+    }
     if (p?.driving) {                               // stop the truck safely while we wait
       const vs = this.vsims.get(p.driving);
       if (vs) vs.speed = 0;
@@ -528,6 +599,7 @@ export class CityRoom extends Room {
     const sim = this.sims.get(sid);
     if (p?.driving) this.releaseVehicle(p, sim, false);
     if (p?.carrying && sim) this.dropPackage(p, sim, 0);   // package stays in the world
+    for (const pkg of this.state.packages.values()) if (pkg.ownerId === sid) pkg.ownerId = '';   // golden is free again
     this.state.players.delete(sid);
     this.sims.delete(sid);
     this.updateCounts();
@@ -549,9 +621,10 @@ export class CityRoom extends Room {
     const sp = LAYOUT.spawnPoints[slot % LAYOUT.spawnPoints.length];
     return {
       position: { x: sp.x, y: sp.y, z: sp.z }, velocity: { x: 0, z: 0 }, impulse: { x: 0, z: 0 },
-      rotationY: sp.rotY, moving: false,
+      rotationY: sp.rotY, moving: false, vy: 0, air: false, stun: 0, landed: false,
       queue: [], lastQueuedSeq: 0, lastSeq: 0, budget: 1, budgetAt: performance.now(),
-      lastInteract: 0, lastEmote: 0, protectedUntil: 0
+      lastInteract: 0, lastEmote: 0, lastChat: 0, protectedUntil: 0, knockAt: 0,
+      intent: { mx: 0, mz: 0, speed: 0 }
     };
   }
 
@@ -559,7 +632,7 @@ export class CityRoom extends Room {
     const sp = LAYOUT.spawnPoints[p.slot % LAYOUT.spawnPoints.length];
     sim.position.x = sp.x; sim.position.y = sp.y; sim.position.z = sp.z;
     sim.velocity.x = 0; sim.velocity.z = 0; sim.impulse.x = 0; sim.impulse.z = 0;
-    sim.rotationY = sp.rotY; sim.moving = false;
+    sim.rotationY = sp.rotY; sim.moving = false; sim.vy = 0; sim.air = false; sim.stun = 0;
   }
 
   writePlayer(p, sim) {
@@ -572,7 +645,12 @@ export class CityRoom extends Room {
     if (p.vz !== s.velocity.z) p.vz = s.velocity.z;
     if (p.ix !== s.impulse.x) p.ix = s.impulse.x;
     if (p.iz !== s.impulse.z) p.iz = s.impulse.z;
-    if (p.moving !== s.moving) { p.moving = s.moving; p.anim = s.moving ? 'run' : 'idle'; }
+    if (p.vy !== s.vy) p.vy = s.vy;
+    if (p.air !== s.air) p.air = s.air;
+    if (p.stun !== s.stun) p.stun = s.stun;
+    if (p.moving !== s.moving) p.moving = s.moving;
+    const anim = s.stun > 0 ? 'stun' : s.air ? 'air' : s.moving ? 'run' : p.emote ? 'emote' : 'idle';
+    if (p.anim !== anim) p.anim = anim;
     if (p.ack !== s.lastSeq) p.ack = s.lastSeq;
   }
 
@@ -593,14 +671,26 @@ export class CityRoom extends Room {
     this.state.joinable = this.state.players.size < GAME.maxPlayers;
   }
 
-  /* Movement modifiers for a walking player: carried weight, flood water, trucks. */
+  /* Movement modifiers for a walking player: carried weight, flood water, trucks + props. */
   walkMods(p, floods, circles) {
-    let carryMul = 1, canSprint = true;
+    let carryMul = 1, canSprint = true, canJump = true;
     if (p.carrying) {
       const pkg = this.state.packages.get(p.carrying);
-      if (pkg) { const w = weightOf(pkg.type); carryMul = w.speedMul || 1; canSprint = w.canSprint; }
+      if (pkg) { const w = weightOf(pkg.type); carryMul = w.speedMul || 1; canSprint = w.canSprint; canJump = w.canJump; }
     }
-    return { carryMul, canSprint, floods, circles };
+    return { carryMul, canSprint, canJump, floods, circles };
+  }
+
+  /* Server-authoritative knockback with cooldown + protection. Never during breaks. */
+  knock(p, sim, dx, dz, strength, up, stun, by, now = Date.now()) {
+    if (isBreakPhase(this.state.phase) || p.driving || !p.connected || p.role !== 'active') return false;
+    if (now < sim.protectedUntil || now - sim.knockAt < KNOCKBACK.cooldownSeconds * 1000) return false;
+    applyKnock(sim, dx, dz, strength, up, stun);
+    sim.knockAt = now;
+    sim.protectedUntil = now + KNOCKBACK.protectSeconds * 1000;
+    if (p.emote) p.emote = '';
+    this.clients.find(c => c.sessionId === p.sessionId)?.send('hazard', { kind: 'knocked', by });
+    return true;
   }
 
   /* ---------------- package condition ---------------- */
@@ -623,15 +713,18 @@ export class CityRoom extends Room {
       if (i >= 0) v.cargo.splice(i, 1);
     }
     this.broadcast('feed', { kind: 'broken', type: pkg.type, reason, name: carrier?.name || '' });
+    if (packageDef(pkg.type).golden) this.broadcast('golden', { phase: 'broken' });
     this.removePackage(pkg.id, true, CONDITION.brokenRespawnSeconds);
   }
 
   removePackage(id, respawn, delaySeconds = GAME.packageRespawnSeconds) {
-    if (!this.state.packages.has(id)) return;
+    const pkg = this.state.packages.get(id);
+    if (!pkg) return;
+    if (packageDef(pkg.type).golden) respawn = false;      // the Golden Package is never restocked
     this.state.packages.delete(id);
     this.cond.delete(id);
     this.groundInfo.delete(id);
-    if (respawn && this.state.phase === 'playing') this.pendingSpawns.push(Date.now() + delaySeconds * 1000);
+    if (respawn) this.pendingSpawns.push(Date.now() + delaySeconds * 1000);
   }
 
   /* Put a carried package on the ground next to the player. */
@@ -725,7 +818,7 @@ export class CityRoom extends Room {
       const driveMode = (flags & 2) !== 0;
       const input = driveMode
         ? sanitizeDriveInput({ steer: tuple[1], throttle: tuple[2], brake: (flags & 1) !== 0 })
-        : sanitizeMoveInput({ mx: tuple[1], mz: tuple[2], sp: (flags & 1) !== 0 });
+        : sanitizeMoveInput({ mx: tuple[1], mz: tuple[2], sp: (flags & 1) !== 0, jp: (flags & 4) !== 0 });
       if (!input) continue;
       input.seq = seq;
       input.drive = driveMode;
@@ -744,10 +837,10 @@ export class CityRoom extends Room {
     const now = Date.now();
     if (now - sim.lastInteract < GAME.interactCooldownMs) return;
     sim.lastInteract = now;
-    if (this.state.phase !== 'playing') return;
     const s = this.state;
+    if (s.phase === PHASES.RESULTS) { client.send('interactResult', { ok: false, kind: 'none', reason: 'resultsBreak' }); return; }
     const act = resolveInteraction({
-      x: sim.position.x, z: sim.position.z, carrying: p.carrying, driving: p.driving,
+      x: sim.position.x, z: sim.position.z, carrying: p.carrying, driving: p.driving, self: sid,
       packages: s.packages, vehicles: s.vehicles, destinations: s.destinations
     });
     const pkg = act.packageId ? s.packages.get(act.packageId) : null;
@@ -757,24 +850,32 @@ export class CityRoom extends Room {
     switch (act.kind) {
       case 'deliver':
       case 'deliverFromTruck': {
+        if (!deliveriesAllowed(s.phase)) { reply(false, { reason: 'breakNoDeliveries' }); return; }
         const reward = deliveryReward(pkg.reward, pkg.condition);
         if (reward <= 0) { reply(false, { reason: 'broken' }); return; }
         if (act.kind === 'deliver') p.carrying = '';
         else { const i = v.cargo.indexOf(pkg.id); if (i >= 0) v.cargo.splice(i, 1); }
-        p.score += reward;
-        p.deliveries += 1;
-        const condition = pkg.condition, type = pkg.type;
-        this.removePackage(pkg.id, true);
-        reply(true, { reward, type, condition });
-        this.broadcast('feed', { kind: 'delivered', sid, name: p.name, reward, type, condition });
+        const rush = s.phase === PHASES.RUSH;
+        this.awardDelivery(p, reward, rush);
+        const condition = pkg.condition, type = pkg.type, golden = !!packageDef(type).golden;
+        const dest = s.destinations.get(pkg.destinationId);
+        this.removePackage(pkg.id, !golden);
+        reply(true, { reward, type, condition, rush });
+        this.broadcast('feed', { kind: 'delivered', sid, name: p.name, reward, type, condition, rush, x: dest?.x ?? sim.position.x, z: dest?.z ?? sim.position.z });
+        if (golden) { this.goldenWinner = sid; this.broadcast('golden', { phase: 'delivered', name: p.name, sid, reward }); }
         return;
       }
-      case 'pickup':
+      case 'pickup': {
+        const golden = !!packageDef(pkg.type).golden;
+        if (golden && pkg.ownerId && pkg.ownerId !== sid) { reply(false, { reason: 'goldenTaken' }); return; }
         Object.assign(pkg, { status: 'carried', carrierId: sid, vehicleId: '', slot: -1 });
         this.groundInfo.delete(pkg.id);
         p.carrying = pkg.id;
+        if (p.emote) p.emote = '';
         reply(true, { id: pkg.id, type: pkg.type });
+        if (golden && !pkg.ownerId) { pkg.ownerId = sid; this.broadcast('golden', { phase: 'claimed', name: p.name, sid }); }
         return;
+      }
       case 'loadCarried':
         Object.assign(pkg, { status: 'loaded', carrierId: '', vehicleId: v.id });
         v.cargo.push(pkg.id);
@@ -811,7 +912,7 @@ export class CityRoom extends Room {
   handleDrop(client) {
     const p = this.state.players.get(client.sessionId);
     const sim = this.sims.get(client.sessionId);
-    if (!p || !sim || !p.carrying || p.driving || this.state.phase !== 'playing') return;
+    if (!p || !sim || !p.carrying || p.driving || this.state.phase === PHASES.RESULTS) return;
     const pkg = this.state.packages.get(p.carrying);
     const speed = Math.hypot(sim.velocity.x, sim.velocity.z);
     const dmg = pkg && packageDef(pkg.type).fragile && speed > CONDITION.dropSpeedThreshold ? CONDITION.dropDamage : 0;
@@ -837,80 +938,196 @@ export class CityRoom extends Room {
     client.send('interactResult', { ok: true, kind: 'resetVehicle' });
   }
 
+  /* G wheel: a gesture. Synced as id + server start time; interrupted by moving, jumping, hits. */
   handleEmote(client, msg) {
+    const sim = this.sims.get(client.sessionId);
+    const p = this.state.players.get(client.sessionId);
+    if (!sim || !p || p.role !== 'active' || p.driving) return;
+    const id = msg && msg.id;
+    const def = EMOTE_LIST.find(e => e.id === id);
+    if (!def) return;
+    const now = Date.now();
+    if (now - sim.lastEmote < GAME.emoteCooldownMs) return;
+    if (sim.air || sim.stun > 0 || sim.moving) return;
+    sim.lastEmote = now;
+    p.emote = def.id; p.emoteAt = now;
+    this.writePlayer(p, sim);
+  }
+  /* T wheel: preset phrases only (no free text). */
+  handleChat(client, msg) {
     const sim = this.sims.get(client.sessionId);
     const p = this.state.players.get(client.sessionId);
     if (!sim || !p) return;
     const id = msg && msg.id;
-    if (!Number.isInteger(id) || id < 0 || id >= EMOTES.length) return;
+    if (!Number.isInteger(id) || id < 0 || id >= QUICK_CHAT.length) return;
     const now = Date.now();
-    if (now - sim.lastEmote < GAME.emoteCooldownMs) return;
-    sim.lastEmote = now;
-    this.broadcast('emote', { sid: client.sessionId, id });
+    if (now - sim.lastChat < GAME.chatCooldownMs) return;
+    sim.lastChat = now;
+    this.broadcast('chat', { sid: client.sessionId, id });
   }
 
-  /* ---------------- match flow ---------------- */
-  startMatch() {
-    const now = Date.now();
+  handleBusy(client, busy) {
+    const p = this.state.players.get(client.sessionId);
+    if (p && p.busy !== busy) p.busy = busy;
+  }
+
+  /* Scoring: every delivery counts for the session total; during a rush it also counts for the rush. */
+  awardDelivery(p, reward, rush) {
+    p.score += reward;
+    p.deliveries += 1;
+    if (rush) {
+      p.rushScore += reward;
+      p.rushDeliveries += 1;
+      if (reward > p.rushBest) p.rushBest = Math.min(65535, reward);
+    }
+  }
+
+  /* ---------------- continuous city: phase machine ----------------
+     free_play → rush_warning → delivery_rush → results → intermission → free_play …
+     The room persists; each room keeps its own schedule (all server timestamps). */
+  setPhase(phase, seconds, now) {
     const s = this.state;
-    s.phase = 'playing';
-    s.matchNumber += 1;
-    s.matchStartedAt = now;
-    s.matchEndsAt = now + CONFIG.matchSeconds * 1000;
-    s.phaseEndsAt = s.matchEndsAt;
-    s.timeLeft = Math.ceil(CONFIG.matchSeconds);
-    s.results.clear();
-    s.packages.clear();
-    this.cond.clear(); this.groundInfo.clear();
-    this.pendingSpawns.length = 0;
-    // trucks back to the depot, empty
-    for (const [id, v] of s.vehicles) {
-      v.driverId = ''; v.cargo.clear();
-      this.resetVehicleToSpawn(v, this.vsims.get(id));
-      this.vsims.get(id).lastReset = 0;
-    }
-    for (const [sid, p] of s.players) {
-      const sim = this.sims.get(sid);
-      p.role = 'active';            // spectators with reserved slots join the new round
-      p.score = 0; p.deliveries = 0; p.carrying = ''; p.driving = '';
-      if (sim) { this.respawn(p, sim); this.writePlayer(p, sim); }
-    }
-    this.disasters.reset(now);
+    s.phase = phase;
+    s.phaseStartedAt = now;
+    s.phaseEndsAt = now + seconds * 1000;
+    s.timeLeft = Math.ceil(seconds);
+    if (phase === PHASES.FREE_PLAY) s.nextRushAt = s.phaseEndsAt + CONFIG.rushWarningSeconds * 1000;
+    else if (phase === PHASES.RUSH_WARNING) s.nextRushAt = s.phaseEndsAt;
+    else s.nextRushAt = 0;
+    this.breakHoldSince = 0;
+    this.broadcast('phase', { phase, rushNumber: s.rushNumber, endsAt: s.phaseEndsAt });
+  }
+
+  openCity() {
+    const now = Date.now();
     for (let i = 0; i < GAME.maxPackages; i++) this.spawnPackage();
-    this.updateCounts();
-    this.broadcast('matchStart', { matchNumber: s.matchNumber });
+    this.disasters.schedule(now, CONFIG.disasterFirstDelay);
+    this.setPhase(PHASES.FREE_PLAY, CONFIG.firstFreePlaySeconds, now);
   }
 
-  endMatch() {
-    const now = Date.now();
+  advancePhase(now) {
     const s = this.state;
-    s.phase = 'results';
-    s.phaseEndsAt = now + CONFIG.intermissionSeconds * 1000;
-    s.timeLeft = Math.ceil(CONFIG.intermissionSeconds);
+    switch (s.phase) {
+      case PHASES.FREE_PLAY:
+        this.setPhase(PHASES.RUSH_WARNING, CONFIG.rushWarningSeconds, now);
+        break;
+      case PHASES.RUSH_WARNING:
+        this.startRush(now);
+        break;
+      case PHASES.RUSH:
+        this.endRush(now);
+        break;
+      case PHASES.RESULTS:
+        this.setPhase(PHASES.INTERMISSION, CONFIG.intermissionSeconds, now);
+        break;
+      case PHASES.INTERMISSION: {
+        // ad-ready hook: wait (briefly) for connected clients that report they are busy
+        const busy = [...s.players.values()].some(p => p.connected && p.busy);
+        if (busy) {
+          if (!this.breakHoldSince) this.breakHoldSince = now;
+          if (now - this.breakHoldSince < CONFIG.breakMaxExtraWaitSeconds * 1000) return;
+        }
+        for (const p of s.players.values()) p.busy = false;
+        this.disasters.schedule(now, CONFIG.disasterFirstDelay);
+        this.setPhase(PHASES.FREE_PLAY, CONFIG.freePlaySeconds, now);
+        break;
+      }
+      default:
+        this.setPhase(PHASES.FREE_PLAY, CONFIG.freePlaySeconds, now);
+    }
+  }
+
+  startRush(now) {
+    const s = this.state;
+    s.rushNumber += 1;
+    s.rushStartedAt = now;
+    s.rushEndsAt = now + CONFIG.rushSeconds * 1000;
+    s.results.clear();
+    for (const p of s.players.values()) { p.rushScore = 0; p.rushDeliveries = 0; p.rushBest = 0; }
+    this.setPhase(PHASES.RUSH, CONFIG.rushSeconds, now);
+    // a disaster already running from free play carries on; otherwise the next one comes soon
+    if (!this.disasters.event) this.disasters.nextAt = Math.min(this.disasters.nextAt, now + 12 * 1000);
+    // at most one Golden Package per rush, at a random moment (never too late to deliver it)
+    const [lo, hi] = GOLDEN.spawnWindowSeconds;
+    let at = CONFIG.goldenAt ?? (lo + Math.random() * (hi - lo));
+    if (CONFIG.rushSeconds - at < GOLDEN.minRushLeftSeconds && CONFIG.goldenAt === null) at = Math.max(0, CONFIG.rushSeconds - GOLDEN.minRushLeftSeconds);
+    this.goldenAt = now + at * 1000;
+    this.goldenWinner = '';
+  }
+
+  endRush(now) {
+    const s = this.state;
     const ranked = [...s.players.values()]
       .filter(p => p.role === 'active')
-      .sort((a, b) => b.score - a.score || b.deliveries - a.deliveries || a.name.localeCompare(b.name));
+      .sort((a, b) => b.rushScore - a.rushScore || b.rushDeliveries - a.rushDeliveries || a.name.localeCompare(b.name));
     s.results.clear();
     let rank = 0, prevScore = -1;
     ranked.forEach((p, i) => {
-      if (p.score !== prevScore) { rank = i + 1; prevScore = p.score; }
+      if (p.rushScore !== prevScore) { rank = i + 1; prevScore = p.rushScore; }
+      const personalBest = p.rushScore > 0 && p.rushScore > p.bestRush;
+      if (personalBest) p.bestRush = p.rushScore;
       const r = new ResultEntry();
-      Object.assign(r, { sessionId: p.sessionId, name: p.name, score: p.score, deliveries: p.deliveries, rank });
+      Object.assign(r, {
+        sessionId: p.sessionId, name: p.name, score: p.rushScore, deliveries: p.rushDeliveries,
+        bestDelivery: p.rushBest, personalBest, golden: this.goldenWinner === p.sessionId, skin: p.skin, rank
+      });
       s.results.push(r);
     });
-    for (const p of s.players.values()) p.carrying = '';
-    for (const v of s.vehicles.values()) { v.cargo.clear(); this.vsims.get(v.id).speed = 0; }
-    s.packages.clear();
-    this.cond.clear(); this.groundInfo.clear();
-    this.pendingSpawns.length = 0;
-    this.disasters.plan = [];          // no hazards during results; cleared now
-    this.disasters.clear();
-    this.disasters.current = -1;
-    this.broadcast('matchEnd', { matchNumber: s.matchNumber });
+    this.onRushRewards(s.results);       // reward-calculation hook (no persisted economy yet)
+    this.goldenAt = Infinity;
+    for (const pkg of [...s.packages.values()]) if (packageDef(pkg.type).golden) this.expireGolden(pkg, 'rushOver');
+    // results: hazards off, scoring frozen, everyone protected
+    this.disasters.stop();
+    for (const [sid, p] of s.players) {
+      const sim = this.sims.get(sid);
+      if (sim) { sim.impulse.x = sim.impulse.z = 0; sim.velocity.x = sim.velocity.z = 0; }
+      if (p.role === 'spectator') {          // late joiners get a body for the next round
+        p.role = 'active';
+        if (sim) { this.respawn(p, sim); this.writePlayer(p, sim); }
+      }
+    }
+    for (const vs of this.vsims.values()) vs.speed = 0;
+    this.updateCounts();
+    this.setPhase(PHASES.RESULTS, CONFIG.resultsSeconds, now);
+    this.goldenWinner = '';
+  }
+
+  /* Reward-calculation hook for a finished rush. Milestones 5/6 will grant + persist rewards
+     here (server-side only). For now it only computes a preview and nothing is stored. */
+  onRushRewards(results) {
+    this.lastRewardPreview = computeRushRewards([...results].map(r => ({ sessionId: r.sessionId, score: r.score, rank: r.rank, deliveries: r.deliveries, golden: r.golden })));
+  }
+
+  /* ---------------- Golden Package ---------------- */
+  spawnGolden(now) {
+    const s = this.state;
+    if ([...s.packages.values()].some(p => packageDef(p.type).golden)) return;
+    const spots = GOLDEN.spots;
+    const spot = spots[CONFIG.goldenSpot !== null ? clamp(CONFIG.goldenSpot | 0, 0, spots.length - 1) : Math.floor(Math.random() * spots.length)];
+    const far = LAYOUT.buildings.filter(b => Math.hypot(b.doorX - spot.x, b.doorZ - spot.z) >= GOLDEN.minDestinationDistance);
+    const pool = far.length ? far : LAYOUT.buildings;
+    const dest = pool[Math.floor(Math.random() * pool.length)];
+    const pkg = new PackageState();
+    const id = `G${s.rushNumber}`;
+    Object.assign(pkg, {
+      id, type: 'golden', status: 'available', carrierId: '', vehicleId: '', slot: -1,
+      x: spot.x, y: WORLD.groundHeight(spot.x, spot.z), z: spot.z, destinationId: dest.id,
+      reward: PACKAGE_TYPES.golden.reward, condition: 100, ownerId: '', expiresAt: now + CONFIG.goldenLifetime * 1000
+    });
+    this.cond.set(id, 100);
+    s.packages.set(id, pkg);
+    this.broadcast('golden', { phase: 'spawn', id, label: spot.label, x: spot.x, z: spot.z, seconds: CONFIG.goldenLifetime });
+  }
+  expireGolden(pkg, reason = 'expired') {
+    const carrier = pkg.carrierId && this.state.players.get(pkg.carrierId);
+    if (carrier && carrier.carrying === pkg.id) carrier.carrying = '';
+    this.state.packages.delete(pkg.id);
+    this.cond.delete(pkg.id); this.groundInfo.delete(pkg.id);
+    if (reason === 'expired') this.broadcast('golden', { phase: 'expired' });
   }
 
   pickPackageType() {
-    const pool = CONFIG.packagePool.length ? CONFIG.packagePool.map(k => [k, PACKAGE_TYPES[k]]) : Object.entries(PACKAGE_TYPES);
+    const pool = (CONFIG.packagePool.length ? CONFIG.packagePool.map(k => [k, PACKAGE_TYPES[k]]) : Object.entries(PACKAGE_TYPES)).filter(([, d]) => d.spawnWeight > 0);
     const total = pool.reduce((sum, [, d]) => sum + d.spawnWeight, 0);
     let roll = Math.random() * total;
     for (const [k, d] of pool) { roll -= d.spawnWeight; if (roll <= 0) return k; }
@@ -924,8 +1141,9 @@ export class CityRoom extends Room {
     return -1;
   }
 
+  depotStock() { let n = 0; for (const p of this.state.packages.values()) if (p.type !== 'golden') n++; return n; }
   spawnPackage() {
-    if (this.state.packages.size >= GAME.maxPackages) return false;
+    if (this.depotStock() >= GAME.maxPackages) return false;
     const slot = this.freePadSlot();
     if (slot < 0) return false;
     const destInUse = new Set([...this.state.packages.values()].map(p => p.destinationId));
@@ -937,7 +1155,7 @@ export class CityRoom extends Room {
     const sp = LAYOUT.packageSlots[slot];
     this.packageCounter += 1;
     Object.assign(pkg, {
-      id: `P${this.state.matchNumber}-${this.packageCounter}`, type, status: 'available', carrierId: '', vehicleId: '',
+      id: `P${this.packageCounter}`, type, status: 'available', carrierId: '', vehicleId: '',
       slot, x: sp.x, y: sp.y, z: sp.z, destinationId: dest.id, reward: PACKAGE_TYPES[type].reward, condition: 100
     });
     this.cond.set(pkg.id, 100);
@@ -976,15 +1194,15 @@ export class CityRoom extends Room {
         this.damagePackage(pkg, rate * DT * scale, 'tornado');
       }
       if (dd < T.coreRadius && !protectedNow) {
-        sim.protectedUntil = now + T.protectSeconds * 1000;   // brief recovery protection
-        sim.impulse.x += fx * T.maxImpulse * 0.6; sim.impulse.z += fz * T.maxImpulse * 0.6;
-        const cur = p.carrying ? s.packages.get(p.carrying) : null;
-        if (cur) {
-          const dmg = packageDef(cur.type).fragile ? T.knockDamage.fragile : T.knockDamage.normal;
-          this.dropPackage(p, sim, dmg, 2.2);   // knocked out of the courier's hands
+        // core hit: launched into the air + a short stun, then brief recovery protection
+        if (this.knock(p, sim, fx, fz, T.maxImpulse * 0.6, KNOCKBACK.tornadoCore.up, KNOCKBACK.tornadoCore.stun, 'tornado', now)) {
+          sim.protectedUntil = now + T.protectSeconds * 1000;
+          const cur = p.carrying ? s.packages.get(p.carrying) : null;
+          if (cur) {
+            const dmg = packageDef(cur.type).fragile ? T.knockDamage.fragile : T.knockDamage.normal;
+            this.dropPackage(p, sim, dmg, 2.2);   // knocked out of the courier's hands
+          }
         }
-        const client = this.clients.find(c => c.sessionId === sid);
-        client?.send('hazard', { kind: 'knocked' });
       }
     }
     // unclaimed packages on the ground drift with the wind (limited, stays in map)
@@ -1026,8 +1244,9 @@ export class CityRoom extends Room {
         const f = floodAt(floods, pkg.x, pkg.z);
         if (f && f.depth > 0.1) { this.damagePackage(pkg, DISASTER.flood.groundDamagePerSec * DT, 'water'); if (!this.state.packages.has(pkg.id)) continue; }
       }
-      // packages left lying around return to a free depot pad
+      // packages left lying around return to a free depot pad (the Golden Package stays put)
       const info = this.groundInfo.get(pkg.id);
+      if (pkg.type === 'golden') continue;
       if (pkg.slot < 0 && info && now - info.since > CONDITION.groundReturnSeconds * 1000) {
         const slot = this.freePadSlot();
         if (slot >= 0) {
@@ -1039,18 +1258,109 @@ export class CityRoom extends Room {
     }
   }
 
+  /* Moving trucks knock couriers over (never the driver, never during breaks). */
+  truckHits(now) {
+    const K = KNOCKBACK.truck, s = this.state;
+    for (const [id, vs] of this.vsims) {
+      const sp = Math.abs(vs.speed);
+      if (sp < K.minSpeed) continue;
+      const g = vehicleGeometry(vs), dir = Math.sign(vs.speed);
+      for (const [sid, p] of s.players) {
+        const sim = this.sims.get(sid);
+        if (!sim || p.driving || p.role !== 'active') continue;
+        for (const c of g.circles) {
+          const dx = sim.position.x - c.x, dz = sim.position.z - c.z, d = Math.hypot(dx, dz);
+          if (d > VEHICLE.radius + PLAYER.radius + K.pad) continue;
+          const nx = d > 1e-3 ? dx / d : g.rx, nz = d > 1e-3 ? dz / d : g.rz;
+          this.knock(p, sim, nx + g.fx * dir * 0.8, nz + g.fz * dir * 0.8, K.base + K.perSpeed * sp, K.up, K.stun, 'truck', now);
+          break;
+        }
+      }
+    }
+  }
+
+  /* Dynamic props: pushed by couriers (walk intent) and trucks; rolling carts knock people. */
+  stepProps(now) {
+    const s = this.state;
+    const pushers = [];
+    for (const [sid, p] of s.players) {
+      const sim = this.sims.get(sid);
+      if (!sim || p.driving || p.role !== 'active' || !p.connected || sim.intent.speed <= 0) continue;
+      pushers.push({ sid, x: sim.position.x, z: sim.position.z, r: PLAYER.radius, ix: sim.intent.mx, iz: sim.intent.mz, speed: sim.intent.speed });
+    }
+    const trucks = [];
+    for (const vs of this.vsims.values()) {
+      const vx = Math.sin(vs.yaw) * vs.speed, vz = Math.cos(vs.yaw) * vs.speed;
+      for (const c of vehicleGeometry(vs).circles) trucks.push({ x: c.x, z: c.z, r: VEHICLE.radius, vx, vz });
+    }
+    const list = [...this.psims.values()];
+    for (const ps of list) {
+      const res = stepProp(ps, DT, WORLD, pushers, trucks);
+      if (res.touched || res.speed > 0) ps.lastActive = now;
+      if (res.touched) {
+        let best = null, bd = Infinity;
+        for (const q of pushers) { const d = Math.hypot(q.x - ps.x, q.z - ps.z); if (d < bd) { bd = d; best = q; } }
+        if (best && bd < 2.5) { ps.pusher = best.sid; ps.pushedAt = now; }
+      }
+    }
+    separateProps(list);
+    const K = KNOCKBACK.prop;
+    for (const ps of list) {
+      const T = PROP_TYPES[ps.kind];
+      const sp = Math.hypot(ps.vx, ps.vz);
+      if (!T?.knocks || sp < K.minSpeed) continue;
+      for (const [sid, p] of s.players) {
+        const sim = this.sims.get(sid);
+        if (!sim || p.driving || p.role !== 'active') continue;
+        if (sid === ps.pusher && now - (ps.pushedAt || 0) < 1500) continue;   // you can't bowl yourself over
+        if (Math.hypot(sim.position.x - ps.x, sim.position.z - ps.z) > T.radius + PLAYER.radius + 0.12) continue;
+        if (this.knock(p, sim, ps.vx, ps.vz, K.base + K.perSpeed * sp, K.up, K.stun, 'prop', now)) { ps.vx *= 0.4; ps.vz *= 0.4; }
+      }
+    }
+    for (const [id, ps] of this.psims) {
+      // a prop left far from home for a while returns there — never while someone is near it
+      const away = Math.hypot(ps.x - ps.home.x, ps.z - ps.home.z);
+      if (away > PROPS.resetAwayDistance && now - ps.lastActive > CONFIG.propResetSeconds * 1000) {
+        let clear = true;
+        for (const sim of this.sims.values()) {
+          if (Math.hypot(sim.position.x - ps.x, sim.position.z - ps.z) < PROPS.resetClearRadius ||
+              Math.hypot(sim.position.x - ps.home.x, sim.position.z - ps.home.z) < PROPS.resetClearRadius) { clear = false; break; }
+        }
+        for (const vs of this.vsims.values()) if (Math.hypot(vs.x - ps.home.x, vs.z - ps.home.z) < PROPS.resetClearRadius) clear = false;
+        if (clear) { Object.assign(ps, { x: ps.home.x, z: ps.home.z, yaw: ps.home.rotY, vx: 0, vz: 0, lastActive: now }); }
+      }
+      const st = s.props.get(id);
+      if (st.x !== ps.x) st.x = ps.x;
+      if (st.z !== ps.z) st.z = ps.z;
+      if (st.yaw !== ps.yaw) st.yaw = ps.yaw;
+      const mv = ps.vx !== 0 || ps.vz !== 0;
+      if (st.moving !== mv) st.moving = mv;
+    }
+  }
+
+  updateGolden(now) {
+    const s = this.state;
+    if (s.phase === PHASES.RUSH && now >= this.goldenAt) { this.goldenAt = Infinity; this.spawnGolden(now); }
+    for (const pkg of s.packages.values()) {
+      if (pkg.type === 'golden' && pkg.expiresAt && now >= pkg.expiresAt) { this.expireGolden(pkg, 'expired'); break; }
+    }
+  }
+
   /* ---------------- fixed-step simulation ---------------- */
   tick() {
     const now = Date.now();
     const s = this.state;
-    const playing = s.phase === 'playing';
+    const hazards = !isBreakPhase(s.phase);
+    const canMove = movementAllowed(s.phase);
 
-    if (playing) this.disasters.update(now);
-    const floods = playing ? this.disasters.floodsForPhysics : null;
-    if (playing) this.applyTornado(now, floods);
+    if (hazards) this.disasters.update(now, s.phase, s.rushEndsAt);
+    const floods = hazards ? this.disasters.floodsForPhysics : null;
+    if (hazards) this.applyTornado(now, floods);
 
     const allTrucks = [...this.vsims.entries()].map(([id, vs]) => ({ id, x: vs.x, z: vs.z, yaw: vs.yaw }));
     const truckCircles = vehicleCircles(allTrucks);
+    const propList = [...this.psims.values()];
+    const obstacleCircles = truckCircles.concat(propCircles(propList));    // couriers bump into trucks + props
 
     for (const [sid, p] of s.players) {
       const sim = this.sims.get(sid);
@@ -1062,12 +1372,13 @@ export class CityRoom extends Room {
       sim.budgetAt = tNow;
       const v = p.driving ? s.vehicles.get(p.driving) : null;
       const vs = v ? this.vsims.get(v.id) : null;
-      const walkMods = vs ? null : this.walkMods(p, floods, truckCircles);
+      const walkMods = vs ? null : this.walkMods(p, floods, obstacleCircles);
+      sim.intent.speed = 0;
       const driveMods = vs ? { floods, circles: vehicleCircles(allTrucks, v.id) } : null;
       while (sim.budget >= 1 && sim.queue.length) {
         const input = sim.queue.shift();
         if (vs) {
-          const drive = playing && input.drive ? input : ZERO_DRIVE;
+          const drive = canMove && input.drive ? input : ZERO_DRIVE;
           const impact = stepVehicle(vs, drive, DT, WORLD, driveMods);
           if (impact > VEHICLE.crashSpeed && v.cargo.length) {
             for (const id of [...v.cargo]) {
@@ -1078,11 +1389,18 @@ export class CityRoom extends Room {
           sim.position.x = vs.x; sim.position.z = vs.z; sim.position.y = WORLD.groundHeight(vs.x, vs.z);
           sim.rotationY = vs.yaw;
         } else {
-          const walk = playing && !input.drive ? input : ZERO_WALK;
+          const walk = canMove && !input.drive ? input : ZERO_WALK;
           stepMovement(sim, walk, DT, WORLD, walkMods);
+          const sp = (walk.sp && walkMods.canSprint ? PLAYER.sprintSpeed : PLAYER.walkSpeed) * (walkMods.carryMul || 1);
+          sim.intent.mx = walk.mx; sim.intent.mz = walk.mz; sim.intent.speed = (walk.mx || walk.mz) ? sp : 0;
         }
         sim.lastSeq = input.seq;
         sim.budget -= 1;
+      }
+      // gestures end on their own, or as soon as the courier moves / jumps / gets hit / drives
+      if (p.emote) {
+        const def = EMOTE_LIST.find(e => e.id === p.emote);
+        if (!def || sim.moving || sim.air || sim.stun > 0 || p.driving || now - p.emoteAt > def.seconds * 1000) p.emote = '';
       }
       if (vs) this.writeVehicle(v, vs);
       this.writePlayer(p, sim);
@@ -1090,25 +1408,26 @@ export class CityRoom extends Room {
 
     for (const [id, vs] of this.vsims) this.writeVehicle(s.vehicles.get(id), vs);   // parked/dropped trucks too
 
-    if (playing) {
-      this.applyFloodAndGround(now, floods);
-      // idle trucks far from the depot drive themselves home (only when empty)
-      for (const [id, vs] of this.vsims) {
-        const v = s.vehicles.get(id);
-        if (v.driverId || v.cargo.length || !vs.idleSince) continue;
-        if (now - vs.idleSince > VEHICLE.idleReturnSeconds * 1000 && Math.hypot(vs.x - vs.spawn.x, vs.z - vs.spawn.z) > 15 && this.spawnIsFree(vs)) {
-          this.resetVehicleToSpawn(v, vs);
-        }
+    if (hazards) this.truckHits(now);
+    this.stepProps(now);
+    this.updateGolden(now);
+
+    this.applyFloodAndGround(now, floods);
+    // idle trucks far from the depot drive themselves home (only when empty)
+    for (const [id, vs] of this.vsims) {
+      const v = s.vehicles.get(id);
+      if (v.driverId || v.cargo.length || !vs.idleSince) continue;
+      if (now - vs.idleSince > VEHICLE.idleReturnSeconds * 1000 && Math.hypot(vs.x - vs.spawn.x, vs.z - vs.spawn.z) > 15 && this.spawnIsFree(vs)) {
+        this.resetVehicleToSpawn(v, vs);
       }
-      if (now >= s.matchEndsAt) { this.endMatch(); return; }
-      for (let i = this.pendingSpawns.length - 1; i >= 0; i--) {
-        if (now >= this.pendingSpawns[i]) { this.pendingSpawns.splice(i, 1); this.spawnPackage(); }
-      }
-      if (this.pendingSpawns.length === 0 && s.packages.size < GAME.maxPackages) this.spawnPackage();
-    } else if (now >= s.phaseEndsAt) {
-      this.startMatch();
-      return;
     }
+    // the city keeps its depot stocked in every phase
+    for (let i = this.pendingSpawns.length - 1; i >= 0; i--) {
+      if (now >= this.pendingSpawns[i]) { this.pendingSpawns.splice(i, 1); this.spawnPackage(); }
+    }
+    if (this.pendingSpawns.length === 0 && this.depotStock() < GAME.maxPackages) this.spawnPackage();
+
+    if (now >= s.phaseEndsAt) this.advancePhase(now);
     const left = Math.max(0, Math.ceil((s.phaseEndsAt - now) / 1000));
     if (s.timeLeft !== left) s.timeLeft = left;
   }

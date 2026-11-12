@@ -7,7 +7,7 @@
    gameplay constants. No Three.js, no DOM, no Node APIs.
    ===================================================================== */
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 export const NET = {
   tickRate: 30,                 // fixed simulation steps per second (client + server)
@@ -21,17 +21,41 @@ export const NET = {
 
 export const GAME = {
   maxPlayers: 6,
-  matchSeconds: 240,
-  intermissionSeconds: 12,
-  lateJoinWindowSeconds: 45,    // joining later than this into a running match → spectate until next round
+  lateJoinWindowSeconds: 45,    // joining later than this into a running Delivery Rush → spectate until it ends
   reconnectSeconds: 20,
   maxPackages: 6,
   packageRespawnSeconds: 3,
   pickupRadius: 2.4,
   deliveryRadius: 4.5,
   interactCooldownMs: 250,
-  emoteCooldownMs: 1500
+  emoteCooldownMs: 1500,
+  chatCooldownMs: 1500
 };
+
+/* ---------------------------------------------------------------------
+   CONTINUOUS CITY — the room never ends; Delivery Rush events recur.
+   free_play → rush_warning → delivery_rush → results → intermission → free_play …
+   All timing is server-side (epoch ms in state); the server never pauses.
+   --------------------------------------------------------------------- */
+export const PHASES = {
+  FREE_PLAY: 'free_play', RUSH_WARNING: 'rush_warning', RUSH: 'delivery_rush', RESULTS: 'results', INTERMISSION: 'intermission'
+};
+export const CYCLE = {
+  firstFreePlaySeconds: 90,     // a brand-new room gives people time to arrive
+  freePlaySeconds: 45,
+  rushWarningSeconds: 10,
+  rushSeconds: 240,
+  resultsSeconds: 15,
+  intermissionSeconds: 20,
+  breakMaxExtraWaitSeconds: 8   // a client busy with a break (e.g. a future ad) may delay free play this long, at most
+};
+export const PHASE_LABELS = {
+  free_play: 'Free play', rush_warning: 'Rush incoming', delivery_rush: 'Delivery Rush', results: 'Results', intermission: 'Break'
+};
+/* Breaks: no hazards, no knockback, no deliveries. Results also freezes movement. */
+export function isBreakPhase(phase) { return phase === 'results' || phase === 'intermission'; }
+export function deliveriesAllowed(phase) { return !isBreakPhase(phase); }
+export function movementAllowed(phase) { return phase !== 'results'; }
 
 /* ---------------------------------------------------------------------
    PACKAGES — configurable delivery table
@@ -40,10 +64,10 @@ export const GAME = {
    an open truck bed · spawnWeight: relative spawn chance · model: GLB key
    --------------------------------------------------------------------- */
 export const WEIGHT_CLASSES = {
-  light:     { label: 'Light',      speedMul: 1.0,  canSprint: true,  slots: 1, onFoot: true,  tornadoPush: 1.0 },
-  medium:    { label: 'Medium',     speedMul: 0.85, canSprint: true,  slots: 1, onFoot: true,  tornadoPush: 0.5 },
-  heavy:     { label: 'Heavy',      speedMul: 0.6,  canSprint: false, slots: 2, onFoot: true,  tornadoPush: 0.15 },
-  veryheavy: { label: 'Very heavy', speedMul: 0,    canSprint: false, slots: 3, onFoot: false, tornadoPush: 0 }
+  light:     { label: 'Light',      speedMul: 1.0,  canSprint: true,  canJump: true,  slots: 1, onFoot: true,  tornadoPush: 1.0 },
+  medium:    { label: 'Medium',     speedMul: 0.85, canSprint: true,  canJump: true,  slots: 1, onFoot: true,  tornadoPush: 0.5 },
+  heavy:     { label: 'Heavy',      speedMul: 0.6,  canSprint: false, canJump: false, slots: 2, onFoot: true,  tornadoPush: 0.15 },
+  veryheavy: { label: 'Very heavy', speedMul: 0,    canSprint: false, canJump: false, slots: 3, onFoot: false, tornadoPush: 0 }
 };
 export const PACKAGE_TYPES = {
   box:       { label: 'Box',          model: 'box',          reward: 100,  weight: 'light',     fragile: false, waterSensitive: false, spawnWeight: 30 },
@@ -52,7 +76,23 @@ export const PACKAGE_TYPES = {
   aquarium:  { label: 'Aquarium',     model: 'aquarium',     reward: 650,  weight: 'medium',    fragile: true,  waterSensitive: false, spawnWeight: 9 },
   sofa:      { label: 'Sofa',         model: 'sofa',         reward: 500,  weight: 'heavy',     fragile: false, waterSensitive: true,  spawnWeight: 9 },
   piano:     { label: 'Piano',        model: 'piano',        reward: 900,  weight: 'veryheavy', fragile: true,  waterSensitive: true,  spawnWeight: 7 },
-  vip:       { label: 'VIP box',      model: 'vipbox',       reward: 1200, weight: 'medium',    fragile: true,  waterSensitive: true,  spawnWeight: 4 }
+  vip:       { label: 'VIP box',      model: 'vipbox',       reward: 1200, weight: 'medium',    fragile: true,  waterSensitive: true,  spawnWeight: 4 },
+  // Delivery Rush special (never spawns at the depot): see GOLDEN
+  golden:    { label: 'Golden Package', model: 'vipbox',     reward: 2000, weight: 'light',     fragile: true,  waterSensitive: false, spawnWeight: 0, golden: true }
+};
+/* GOLDEN PACKAGE — at most one per Delivery Rush, somewhere in the city (not the depot).
+   The first courier to pick it up owns it (nobody else can take it, even if dropped);
+   it must be carried on foot and disappears if not delivered in time. */
+export const GOLDEN = {
+  spawnWindowSeconds: [45, 100],     // seconds after the rush starts (random inside the window)
+  minRushLeftSeconds: 60,            // never spawn with less rush time left than this
+  lifetimeSeconds: 75,
+  minDestinationDistance: 70,
+  spots: [
+    { x: 0, z: -41, label: 'the park' }, { x: -8, z: 58, label: 'the residential courtyard' },
+    { x: 79.2, z: 50, label: 'the roadworks' }, { x: 82.5, z: -30, label: 'the east ring road' },
+    { x: -82.5, z: 30, label: 'the west ring road' }, { x: -42, z: 8, label: 'the west courtyard' }
+  ]
 };
 export const CONDITION = {
   dropSpeedThreshold: 7,       // dropping while moving faster than this damages fragile cargo
@@ -70,17 +110,18 @@ export function deliveryReward(base, condition) {
 }
 
 /* ---------------------------------------------------------------------
-   DISASTERS — schedule is written for a 240 s match and scaled to the
-   configured match length. Types are picked by the server per slot.
+   DISASTERS — a rolling schedule during free play and Delivery Rush,
+   cleared during results and intermission. Types alternate (server picks).
+   One event = warning → active → recovery.
    --------------------------------------------------------------------- */
 export const DISASTER = {
   types: ['tornado', 'flood'],          // future: 'earthquake', 'storm', ...
-  baseMatchSeconds: 240,
-  schedule: [
-    { warn: 40,  start: 50,  end: 80 },
-    { warn: 110, start: 120, end: 155 },
-    { warn: 180, start: 190, end: 225 }
-  ],
+  rolling: {
+    firstDelaySeconds: 25,              // after a room opens / after each break
+    gapSeconds: { free_play: 30, rush_warning: 30, delivery_rush: 16 },
+    warnSeconds: 10,
+    activeSeconds: { tornado: 30, flood: 35 }
+  },
   recoverySeconds: 6,
   tornado: {
     speed: 6.5, pushRadius: 13, dangerRadius: 6, coreRadius: 3,
@@ -152,14 +193,58 @@ export function cargoSlotsUsed(cargoIds, packages) {
   return n;
 }
 
-export const EMOTES = ['Help!', 'Follow me!', 'Deliver here!', 'Thanks!', "Let's go!"];
+/* Quick chat (T): preset phrases only — no free text. Hidden when CrazyGames disables chat. */
+export const QUICK_CHAT = ['Hello!', 'Follow me!', 'Help me!', 'Nice!', 'Thanks!', 'Watch out!', "Let's deliver!", 'GG!'];
+export const EMOTES = QUICK_CHAT;   // legacy name
+/* Emote wheel (G): gestures. id + server start time are synced; movement/jumps/hits interrupt them. */
+export const EMOTE_LIST = [
+  { id: 'wave',  label: 'Wave',  icon: '👋', seconds: 2.6 },
+  { id: 'dance', label: 'Dance', icon: '🕺', seconds: 6 },
+  { id: 'cheer', label: 'Cheer', icon: '🙌', seconds: 3 },
+  { id: 'point', label: 'Point', icon: '👉', seconds: 2.6 },
+  { id: 'laugh', label: 'Laugh', icon: '😂', seconds: 3 }
+];
 
 export const PLAYER = {
   radius: 0.45, walkSpeed: 6, sprintSpeed: 9.5,
   acceleration: 10, deceleration: 16, stopThreshold: 0.15,
   turnSpeed: 12, stepSmoothing: 18,
-  movingOn: 0.6, movingOff: 0.3
+  movingOn: 0.6, movingOff: 0.3,
+  // jumping (Space): ~1.4 m high, one jump only (no double jump), limited air control
+  gravity: 26, jumpSpeed: 9.0, airControl: 0.35, airDrag: 0.6,
+  stepDown: 0.45,            // walking off anything taller than this is a fall, not a step
+  standMargin: 0.6,          // feet may overhang an edge by this fraction of the radius
+  maxFallSpeed: 30
 };
+
+/* KNOCKBACK — server-authoritative. Impulse is horizontal (decays), `up` is a vertical
+   launch, `stun` blocks input briefly. Every hit gives a short protection window. */
+export const KNOCKBACK = {
+  maxImpulse: 12, cooldownSeconds: 0.9, protectSeconds: 1.6,
+  truck: { minSpeed: 3, perSpeed: 0.75, base: 3, up: 5.5, stun: 0.55, pad: 0.2 },
+  prop:  { minSpeed: 3.2, perSpeed: 0.9, base: 2, up: 3.5, stun: 0.4 },
+  tornadoCore: { up: 7.5, stun: 0.9 },
+  playerPush: 0              // couriers never shove each other (anti-grief)
+};
+export function applyKnock(state, dx, dz, strength, up = 0, stun = 0) {
+  const l = Math.hypot(dx, dz) || 1;
+  const imp = state.impulse;
+  imp.x += (dx / l) * strength; imp.z += (dz / l) * strength;
+  const il = Math.hypot(imp.x, imp.z);
+  if (il > KNOCKBACK.maxImpulse) { imp.x *= KNOCKBACK.maxImpulse / il; imp.z *= KNOCKBACK.maxImpulse / il; }
+  if (up > 0) { state.vy = Math.max(state.vy || 0, up); state.air = true; }
+  if (stun > 0) state.stun = Math.max(state.stun || 0, stun);
+}
+
+/* DYNAMIC PROPS (server-owned, synced): pushed by couriers and trucks. Couriers collide
+   with them like with trucks; rolling carts/pallet jacks knock people over. */
+export const PROP_TYPES = {
+  trafficcone:  { radius: 0.32, kick: 1.6, friction: 3.2, maxSpeed: 13, spin: 5, rolls: false, knocks: false },
+  woodenbox:    { radius: 0.62, kick: 0.7, friction: 9,   maxSpeed: 6,  spin: 0, rolls: false, knocks: false },
+  platformcart: { radius: 0.85, kick: 1.3, friction: 1.1, maxSpeed: 9,  spin: 0, rolls: true,  knocks: true },
+  palletjack:   { radius: 0.8,  kick: 1.2, friction: 1.3, maxSpeed: 8,  spin: 0, rolls: true,  knocks: true }
+};
+export const PROPS = { resetIdleSeconds: 60, resetAwayDistance: 3, resetClearRadius: 8, truckKick: 1.25 };
 
 export const MAP = { playHalf: 87.5 };
 
@@ -218,7 +303,14 @@ export function buildLayout() {
   const rng = mulberry32(20261111);
   const L = {
     slabs: [], blocks: [], colliders: [], placements: [], buildings: [],
-    spawnPoints: [], packageSlots: [], depot: null, park: null
+    spawnPoints: [], packageSlots: [], depot: null, park: null,
+    props: [],          // dynamic, server-simulated objects (not in placements / colliders)
+    parkour: []         // static shortcut pieces (colliders tagged 'parkour'), drawn by the client
+  };
+  const addProp = (kind, x, z, rotY = 0) => L.props.push({ id: `R${String(L.props.length + 1).padStart(2, '0')}`, kind, x, z, rotY });
+  const addParkour = (kind, minX, maxX, minZ, maxZ, top) => {
+    L.parkour.push({ kind, minX, maxX, minZ, maxZ, top });
+    L.colliders.push({ minX, maxX, minZ, maxZ, minY: 0, maxY: top, blocksCamera: false, tag: 'parkour' });
   };
 
   const addCollider = (minX, maxX, minZ, maxZ, maxY, blocksCamera = false, tag = '') =>
@@ -282,8 +374,10 @@ export function buildLayout() {
     place('woodenbox', cx - 13.6, backZ + 10.0, 0.2);
     place('woodenbox', cx - 13.6, backZ + 8.6, 0.35, { stack: 1, collider: false });
     place('woodenbox', cx + 13.6, backZ + 8.6, -0.15);
-    place('palletjack', cx + 9.6, backZ + 10.8, 0.6);
-    place('platformcart', cx - 9.6, backZ + 10.8, -0.4);
+    addProp('palletjack', cx + 9.6, backZ + 10.8, 0.6);
+    addProp('platformcart', cx - 9.6, backZ + 10.8, -0.4);
+    addProp('woodenbox', cx + 15.2, backZ + 12.5, 0.2);
+    addProp('woodenbox', cx - 15.6, backZ + 13.4, -0.3);
     // Drivable trucks (dynamic, server-owned): parked facing the south avenue
     L.vehicleSpawns = [
       { id: 'T1', x: cx + 11.5, z: cz + 4, yaw: 0 },
@@ -375,12 +469,45 @@ export function buildLayout() {
     for (const s of [1, -1]) place('trafficlight', cx + s * 7.6, cz + s * 7.6, Math.atan2(-s, -s));
   }
 
-  /* ---- roadwork on the east ring road ---- */
-  for (let z = 38; z <= 62; z += 3) place('trafficcone', 75.6, z, rng() * 6.28);
-  for (const z of [38, 62]) for (const x of [77.2, 78.8, 80.3]) place('trafficcone', x, z, rng() * 6.28);
-  place('woodenbox', 78.2, 46, 0.3);
-  place('woodenbox', 78.6, 47.4, -0.2);
-  place('woodenbox', 78.4, 54, 0.1);
+  /* ---- roadwork on the east ring road (pushable cones + crates) ---- */
+  for (let z = 38; z <= 62; z += 3) addProp('trafficcone', 75.6, z, rng() * 6.28);
+  for (const z of [38, 62]) for (const x of [77.2, 78.8, 80.3]) addProp('trafficcone', x, z, rng() * 6.28);
+  addProp('woodenbox', 78.2, 46, 0.3);
+  addProp('woodenbox', 78.6, 47.4, -0.2);
+  addProp('woodenbox', 78.4, 54, 0.1);
+  // a few loose cones around the main crossings
+  for (const [x, z] of [[17.5, 31.5], [-31.5, 17.5], [31.5, -17.5], [-17.5, -31.5]]) addProp('trafficcone', x, z, rng() * 6.28);
+
+  /* ---- parkour shortcuts (all optional: every destination stays reachable on the street) ---- */
+  {
+    const top = d => h + d;   // heights above the sidewalk
+    // 1) Alley hurdles: the west block's alley crossing is fenced by low hurdles — jump through
+    //    the middle of the block instead of walking around it.
+    const w = L.blocks.find(b => b.i === 0 && b.j === 1);
+    for (const sgn of [-1, 1]) {
+      addParkour('hurdle', w.cx + sgn * 3.2 - 0.15, w.cx + sgn * 3.2 + 0.15, w.cz - 3.35, w.cz + 3.35, top(0.7));
+      addParkour('hurdle', w.cx - 3.05, w.cx + 3.05, w.cz + sgn * 3.2 - 0.15, w.cz + sgn * 3.2 + 0.15, top(0.7));
+    }
+    // 2) Construction scaffold: the east block's alley crossing is a fenced building site;
+    //    scaffold steps lead over the fence on the west and east sides.
+    const e = L.blocks.find(b => b.i === 2 && b.j === 1);
+    for (const sgn of [-1, 1]) {
+      addParkour('fence', e.cx + sgn * 3.0 - 0.15, e.cx + sgn * 3.0 + 0.15, e.cz - 3.15, e.cz + 3.15, top(2.2));
+      addParkour('fence', e.cx - 2.85, e.cx + 2.85, e.cz + sgn * 3.0 - 0.15, e.cz + sgn * 3.0 + 0.15, top(2.2));
+      const out = x => e.cx + sgn * x;              // distance from the block centre on this side
+      const span = (a, b) => [Math.min(out(a), out(b)), Math.max(out(a), out(b))];
+      addParkour('scaffold', ...span(6.4, 5.4), e.cz - 1.4, e.cz + 1.4, top(0.85));
+      addParkour('scaffold', ...span(5.4, 4.4), e.cz - 1.4, e.cz + 1.4, top(1.7));
+      addParkour('plank', ...span(4.4, 2.4), e.cz - 1.4, e.cz + 1.4, top(2.35));
+      addParkour('scaffold', ...span(2.4, 1.4), e.cz - 1.4, e.cz + 1.4, top(1.15));
+    }
+    // 3) Depot crate steps: a crate wall closes the gap west of the warehouse; hop up the
+    //    crates for a quick exit to the north road.
+    const D = L.depot;
+    addParkour('crate', D.cx - 19, D.warehouse.minX, D.backZ + 2.6, D.backZ + 3.8, top(2.2));
+    addParkour('crate', D.cx - 18.6, D.cx - 15.8, D.backZ + 3.8, D.backZ + 4.9, top(1.65));
+    addParkour('crate', D.cx - 18.6, D.cx - 15.8, D.backZ + 4.9, D.backZ + 6.0, top(0.85));
+  }
 
   /* ---- border greenery ---- */
   for (let t = -72; t <= 72; t += 24) {
@@ -397,11 +524,24 @@ export function buildLayout() {
    ===================================================================== */
 export function createPhysicsWorld(layout) {
   const { colliders, slabs } = layout;
+  const standable = colliders.filter(c => c.maxY < 10);   // tall buildings are never stood on
   return {
     layout,
     groundHeight(x, z) {
       let g = 0;
       for (const s of slabs) if (x >= s.minX && x <= s.maxX && z >= s.minZ && z <= s.maxZ && s.h > g) g = s.h;
+      return g;
+    },
+    /* Highest surface under a courier whose feet are at `feetY` (sidewalks + tops of
+       crates, containers, parkour pieces). Only tops at or below the feet count. */
+    supportHeight(x, z, feetY, r = PLAYER.radius) {
+      let g = this.groundHeight(x, z);
+      const m = r * PLAYER.standMargin;
+      for (const c of standable) {
+        if (c.maxY <= g || c.maxY > feetY + 0.06) continue;
+        if (x < c.minX - m || x > c.maxX + m || z < c.minZ - m || z > c.maxZ + m) continue;
+        g = c.maxY;
+      }
       return g;
     },
     /* Circle (player) vs boxes. Pushes pos out, returns accumulated push normal in out. */
@@ -452,7 +592,7 @@ export function sanitizeMoveInput(raw) {
   // quantize so client + server simulate the exact same numbers
   mx = Math.round(mx * 1000) / 1000;
   mz = Math.round(mz * 1000) / 1000;
-  return { mx, mz, sp: raw.sp === true || raw.sp === 1 };
+  return { mx, mz, sp: raw.sp === true || raw.sp === 1, jp: raw.jp === true || raw.jp === 1 };
 }
 
 const _n = { x: 0, z: 0 };
@@ -478,21 +618,31 @@ export function walkSpeedMultiplier(mods, x, z) {
   if (f) mul *= f.deep ? DISASTER.flood.walkMul.deep : DISASTER.flood.walkMul.shallow;
   return mul;
 }
-/* mods (optional): { carryMul, canSprint, floods, circles:[{x,z,r}] } */
+/* state: { position, velocity, impulse, rotationY, moving, vy, air, stun }
+   input: { mx, mz, sp, jp }  (jp = jump pressed on this step)
+   mods (optional): { carryMul, canSprint, canJump, floods, circles:[{x,z,r}] }
+   Runs identically on the client (prediction) and the server (authority). */
 export function stepMovement(state, input, dt, world, mods = null) {
   const P = PLAYER, v = state.velocity, pos = state.position;
-  const ix = input.mx, iz = input.mz;
+  if (state.vy === undefined) state.vy = 0;
+  if (state.air === undefined) state.air = false;
+  if (state.stun === undefined) state.stun = 0;
+  const stunned = state.stun > 0;
+  if (stunned) { state.stun = Math.max(0, state.stun - dt); if (state.stun < 1e-4) state.stun = 0; }
+  const ix = stunned ? 0 : input.mx, iz = stunned ? 0 : input.mz;
   const hasInput = ix !== 0 || iz !== 0;
   const canSprint = mods?.canSprint !== false;
   const speed = (input.sp && canSprint ? P.sprintSpeed : P.walkSpeed) * walkSpeedMultiplier(mods, pos.x, pos.z);
-  const k = 1 - Math.exp(-(hasInput ? P.acceleration : P.deceleration) * dt);
+  // on the ground: snappy; in the air: keep momentum, steer a little
+  const rate = state.air ? (hasInput ? P.acceleration * P.airControl : P.airDrag) : (hasInput ? P.acceleration : P.deceleration);
+  const k = 1 - Math.exp(-rate * dt);
   v.x += (ix * speed - v.x) * k;
   v.z += (iz * speed - v.z) * k;
-  if (!hasInput && v.x * v.x + v.z * v.z < P.stopThreshold * P.stopThreshold) { v.x = 0; v.z = 0; }
+  if (!hasInput && !state.air && v.x * v.x + v.z * v.z < P.stopThreshold * P.stopThreshold) { v.x = 0; v.z = 0; }
 
   pos.x += v.x * dt;
   pos.z += v.z * dt;
-  // external impulse (tornado) decays smoothly; synced so prediction replays it
+  // external impulse (tornado / knockback) decays smoothly; synced so prediction replays it
   const imp = state.impulse;
   if (imp && (imp.x !== 0 || imp.z !== 0)) {
     pos.x += imp.x * dt; pos.z += imp.z * dt;
@@ -516,10 +666,28 @@ export function stepMovement(state, input, dt, world, mods = null) {
   if (pos.z < -lim) { pos.z = -lim; if (v.z < 0) v.z = 0; }
   if (pos.z > lim) { pos.z = lim; if (v.z > 0) v.z = 0; }
 
-  const gy = world.groundHeight(pos.x, pos.z);
-  pos.y += (gy - pos.y) * (1 - Math.exp(-P.stepSmoothing * dt));
-  if (Math.abs(gy - pos.y) < 0.002) pos.y = gy;
-  if (pos.y < 0) pos.y = 0;
+  // vertical: ground / standable tops, one jump from the ground, gravity in the air
+  const support = world.supportHeight ? world.supportHeight(pos.x, pos.z, pos.y, P.radius) : world.groundHeight(pos.x, pos.z);
+  state.landed = false;
+  if (!state.air) {
+    if (input.jp && !stunned && mods?.canJump !== false) { state.vy = P.jumpSpeed; state.air = true; }
+    else if (pos.y - support > P.stepDown) { state.air = true; state.vy = 0; }          // walked off a ledge
+    else {
+      pos.y += (support - pos.y) * (1 - Math.exp(-P.stepSmoothing * dt));            // curbs: smooth step
+      if (Math.abs(support - pos.y) < 0.002) pos.y = support;
+    }
+  }
+  if (state.air) {
+    const prevY = pos.y;
+    state.vy = Math.max(-P.maxFallSpeed, state.vy - P.gravity * dt);
+    pos.y += state.vy * dt;
+    if (state.vy <= 0) {
+      // land on whatever we passed through this step (tops between prevY and the new y)
+      const land = world.supportHeight ? world.supportHeight(pos.x, pos.z, prevY, P.radius) : world.groundHeight(pos.x, pos.z);
+      if (pos.y <= land) { pos.y = land; state.vy = 0; state.air = false; state.landed = true; }
+    }
+  }
+  if (pos.y < 0) { pos.y = 0; state.vy = 0; state.air = false; }
 
   if (hasInput) state.rotationY = dampAngle(state.rotationY, Math.atan2(ix, iz), P.turnSpeed, dt);
   else if (Math.hypot(v.x, v.z) > 0.3) state.rotationY = dampAngle(state.rotationY, Math.atan2(v.x, v.z), P.turnSpeed, dt);
@@ -530,6 +698,86 @@ export function stepMovement(state, input, dt, world, mods = null) {
   const sp = Math.hypot(v.x, v.z);
   if (!state.moving && sp > P.movingOn) state.moving = true;
   else if (state.moving && sp < P.movingOff) state.moving = false;
+}
+
+/* Courier is busy with nothing that needs simulating (lets clients skip idle inputs). */
+export function isRestingState(s) {
+  return s.velocity.x === 0 && s.velocity.z === 0 && !s.moving && s.impulse.x === 0 && s.impulse.z === 0 && !s.air && !(s.stun > 0);
+}
+
+/* =====================================================================
+   DYNAMIC PROPS — server-side step (pure, no I/O)
+   prop: { kind, x, z, yaw, vx, vz }
+   pushers: [{ x, z, r, ix, iz, speed }] couriers (intent direction · speed)
+   trucks:  [{ x, z, r, vx, vz }] truck collision circles with their velocity
+   Returns the courier-hit speed when a rolling prop runs into someone (for knockback).
+   ===================================================================== */
+const _pp = { x: 0, y: 0.3, z: 0 }, _pn = { x: 0, z: 0 };
+export function stepProp(prop, dt, world, pushers, trucks) {
+  const T = PROP_TYPES[prop.kind] || PROP_TYPES.trafficcone;
+  let touched = false;
+  for (const q of pushers) {
+    const dx = prop.x - q.x, dz = prop.z - q.z, rr = T.radius + q.r + 0.08;
+    const d2 = dx * dx + dz * dz;
+    if (d2 >= rr * rr) continue;
+    const d = Math.sqrt(d2) || 1e-4, nx = dx / d, nz = dz / d;
+    const into = q.ix * nx + q.iz * nz;              // walking into the prop?
+    if (into <= 0.2 || q.speed <= 0.5) continue;
+    const want = into * q.speed * T.kick;
+    const along = prop.vx * nx + prop.vz * nz;
+    if (along < want) { const add = (want - along) * (1 - Math.exp(-10 * dt)); prop.vx += nx * add; prop.vz += nz * add; }
+    touched = true;
+  }
+  for (const c of trucks) {
+    const dx = prop.x - c.x, dz = prop.z - c.z, rr = T.radius + c.r;
+    const d2 = dx * dx + dz * dz;
+    if (d2 >= rr * rr) continue;
+    const d = Math.sqrt(d2) || 1e-4, nx = dx / d, nz = dz / d;
+    prop.x += nx * (rr - d); prop.z += nz * (rr - d);    // trucks are never blocked by props
+    const tv = Math.hypot(c.vx, c.vz);
+    if (tv > 0.3) { prop.vx = c.vx * PROPS.truckKick + nx * 2; prop.vz = c.vz * PROPS.truckKick + nz * 2; }
+    touched = true;
+  }
+  let sp = Math.hypot(prop.vx, prop.vz);
+  if (sp > T.maxSpeed) { prop.vx *= T.maxSpeed / sp; prop.vz *= T.maxSpeed / sp; sp = T.maxSpeed; }
+  if (sp > 0) {
+    prop.x += prop.vx * dt; prop.z += prop.vz * dt;
+    _pp.x = prop.x; _pp.z = prop.z; _pp.y = 0.3;
+    world.resolveCircle(_pp, T.radius, _pn);
+    if (_pn.x !== 0 || _pn.z !== 0) {                   // bounce off walls
+      const nl = Math.hypot(_pn.x, _pn.z), nx = _pn.x / nl, nz = _pn.z / nl;
+      const dd = prop.vx * nx + prop.vz * nz;
+      if (dd < 0) { prop.vx -= 1.5 * dd * nx; prop.vz -= 1.5 * dd * nz; prop.vx *= 0.6; prop.vz *= 0.6; }
+      prop.x = _pp.x; prop.z = _pp.z;
+    }
+    const lim = MAP.playHalf - 0.5;
+    prop.x = clamp(prop.x, -lim, lim); prop.z = clamp(prop.z, -lim, lim);
+    const f = Math.exp(-T.friction * dt);
+    prop.vx *= f; prop.vz *= f;
+    if (Math.hypot(prop.vx, prop.vz) < 0.08) { prop.vx = 0; prop.vz = 0; }
+    if (T.spin) prop.yaw += T.spin * sp * dt * 0.3;
+    else if (T.rolls && sp > 0.4) prop.yaw = dampAngle(prop.yaw, Math.atan2(prop.vx, prop.vz), 6, dt);
+    if (prop.yaw > Math.PI) prop.yaw -= Math.PI * 2; else if (prop.yaw < -Math.PI) prop.yaw += Math.PI * 2;
+  }
+  return { touched, speed: sp };
+}
+/* Props separate from each other (cheap, a couple of dozen objects). */
+export function separateProps(props) {
+  for (let i = 0; i < props.length; i++) for (let j = i + 1; j < props.length; j++) {
+    const a = props[i], b = props[j];
+    const ra = (PROP_TYPES[a.kind] || PROP_TYPES.trafficcone).radius, rb = (PROP_TYPES[b.kind] || PROP_TYPES.trafficcone).radius;
+    const dx = b.x - a.x, dz = b.z - a.z, rr = ra + rb, d2 = dx * dx + dz * dz;
+    if (d2 >= rr * rr || d2 < 1e-10) continue;
+    const d = Math.sqrt(d2), pen = (rr - d) / 2, nx = dx / d, nz = dz / d;
+    a.x -= nx * pen; a.z -= nz * pen; b.x += nx * pen; b.z += nz * pen;
+    const rel = (b.vx - a.vx) * nx + (b.vz - a.vz) * nz;
+    if (rel < 0) { a.vx += nx * rel * 0.5; a.vz += nz * rel * 0.5; b.vx -= nx * rel * 0.5; b.vz -= nz * rel * 0.5; }
+  }
+}
+export function propCircles(props) {
+  const out = [];
+  for (const p of props) out.push({ x: p.x, z: p.z, r: (PROP_TYPES[p.kind] || PROP_TYPES.trafficcone).radius });
+  return out;
 }
 
 export function distanceXZ(ax, az, bx, bz) { return Math.hypot(ax - bx, az - bz); }
@@ -641,6 +889,7 @@ export function resolveInteraction(ctx) {
   if (carried) {
     const dest = destinations.get(carried.destinationId);
     if (dest && dist(x, z, dest.x, dest.z) <= GAME.deliveryRadius) return { kind: 'deliver', packageId: carried.id };
+    if (rearTruck && packageDef(carried.type).golden) return { kind: 'none', reason: 'goldenOnFoot', vehicleId: rearTruck.id };
     if (rearTruck) {
       const free = V.cargoSlots - cargoSlotsUsed(rearTruck.cargo, packages);
       return free >= weightOf(carried.type).slots
@@ -666,6 +915,7 @@ export function resolveInteraction(ctx) {
   }
   if (best) {
     const w = weightOf(best.type);
+    if (best.ownerId && ctx.self && best.ownerId !== ctx.self) return { kind: 'none', reason: 'goldenTaken', packageId: best.id };
     if (w.onFoot) return { kind: 'pickup', packageId: best.id };
     for (const v of vehicles.values()) {
       const g = vehicleGeometry(v);
@@ -684,4 +934,14 @@ export function resolveInteraction(ctx) {
   }
   if (doorTruck) return { kind: 'enterVehicle', vehicleId: doorTruck.id };
   return { kind: 'none' };
+}
+
+/* =====================================================================
+   RUSH REWARD HOOK — what a finished Delivery Rush *would* be worth.
+   Preview only: nothing is granted or stored yet (permanent economy is
+   Milestone 5/6 and will be computed + persisted on the server).
+   entries: [{ sessionId, score, rank, deliveries, golden }]
+   ===================================================================== */
+export function computeRushRewards(entries) {
+  return entries.map(e => ({ sessionId: e.sessionId, points: e.score, placement: e.rank, golden: !!e.golden, granted: false }));
 }

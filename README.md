@@ -1,4 +1,4 @@
-# Disaster Delivery — Milestone 2 (Colyseus multiplayer + CrazyGames SDK v3)
+# Disaster Delivery — Milestone 4 (continuous city + Delivery Rush)
 
 ## Files
 
@@ -9,7 +9,10 @@ DisasterDelivery/
 ├── server.js           server entry point (local port or Colyseus Cloud socket)
 ├── game-server.js      Colyseus 0.18 room, schemas, matchmaking, validation
 ├── ecosystem.config.cjs PM2 process file required by Colyseus Cloud
-├── test-multiplayer.js automated multi-client tests against a running server
+├── test-multiplayer.js automated multi-client tests against a running server (M2 + lifecycle)
+├── test-milestone3.js  disaster / package condition / truck scenarios
+├── test-milestone4.js  continuous city, jumping, knockback, props, social, Golden Package, parkour
+├── reachability.js     walkability + path helper used by the M4 tests (not needed by the game)
 ├── package.json / package-lock.json
 ├── .env.example        server configuration
 ├── .gitignore
@@ -23,8 +26,8 @@ Versions: **colyseus 0.18.12**, **@colyseus/schema 5.0.x**, **@colyseus/sdk 0.18
 - **Rooms.** `city` room, max 6. Public rooms use `joinOrCreate` with `filterBy(['mode'])`. Private rooms use `create` + `setPrivate(true)`, so matchmaking never sees them. The 6-character room code *is* the Colyseus `roomId`, so `joinById(code)` works on any process.
 - **Authority.** Clients only send movement inputs (`{seq, direction, sprint}`) at 30 Hz. The server validates and quantizes them, rate-limits them with a per-tick budget (speed hacks can't move faster), and runs the same `stepMovement()` from `shared.js` against the same colliders. It syncs position, velocity, rotation, animation state and the last processed input (`ack`) at 20 Hz.
 - **Prediction.** The local player moves instantly. Each server update rewinds to the authoritative state and replays any unacknowledged inputs, with error smoothing. Remote players are interpolated 110 ms in the past.
-- **Matches.** 4 minutes of play, then 12 seconds of results, then the next match in the *same room* with the same group. Scores, packages and spawn positions reset each match.
-  - Late joiners spectate until the next round once the match has run 45 s and at least 2 couriers are playing.
+- **Continuous city (Milestone 4).** The room never ends. It loops free play → rush warning → Delivery Rush → results → intermission → free play, with the same group (details below).
+  - Late joiners spectate only when a Delivery Rush has run 45 s and at least 2 couriers are playing; they get a body when the rush ends.
   - A friend joining a host who is alone plays immediately.
 - **Deliveries.**
   - 6 packages sit on the depot pads: box 100, groceries 150, VIP 500 (edit `PACKAGE_TYPES` in `shared.js`).
@@ -34,7 +37,7 @@ Versions: **colyseus 0.18.12**, **@colyseus/schema 5.0.x**, **@colyseus/sdk 0.18
   - A dropped connection keeps its seat for 20 s, and the Colyseus SDK reconnects automatically.
   - A consented leave, or a seat that expires, removes the player and puts any carried package back in rotation.
   - The room disposes itself when empty.
-- **Quick chat.** **Q** opens it, **1–5** send one of five predefined phrases. No free text. Other players' phrases are hidden if CrazyGames' `disableChat` setting is on.
+- **Quick chat / emotes.** **T** opens an 8-phrase quick-chat wheel, **G** a 5-gesture emote wheel (Milestone 4). No free text. Quick chat is hidden entirely if CrazyGames' `disableChat` setting is on.
 
 ### CrazyGames integration (in `index.html`, class `Platform`)
 
@@ -47,14 +50,14 @@ Versions: **colyseus 0.18.12**, **@colyseus/schema 5.0.x**, **@colyseus/sdk 0.18
 | Invite at startup | Valid `game.inviteParams` → join that exact room by code, skip the menu, use the stored or default character. |
 | Invite while playing | One `addJoinRoomListener` is registered. It leaves the current room cleanly and joins the invited one. Overlapping requests are queued (latest wins). |
 | Invite link | The INVITE FRIENDS button uses `game.inviteLink(...)`. Without the SDK it copies the room code instead. |
-| Gameplay events | `gameplayStart()` only while you are an active courier in a running round. `gameplayStop()` in menus, results, spectating and while reconnecting. `loadingStart/Stop` during asset loading. No ads are requested. |
+| Gameplay events | `gameplayStart()` while you are an active courier in free play, the rush warning or a Delivery Rush. `gameplayStop()` in menus, results, intermission, spectating and while reconnecting (no tab-visibility gating). `loadingStart/Stop` during asset loading. No ads are requested. |
 
 ## Milestone 3 — disasters, package condition, trucks
 
 **Disasters** (`DisasterController` in `game-server.js`, settings in `DISASTER` in `shared.js`):
-- Three disaster slots per match. In a 240 s match: warning at 0:40, active 0:50–1:20, then 2:00–2:35, then 3:10–3:45.
-- Phases: `inactive → warning → active → recovery`. Times scale with `MATCH_SECONDS`, and each slot picks a type (never the same twice in a row).
-- Everything is in synced state (`state.disaster`). Players who join mid-disaster see it straight away. Results and the next match always start clean.
+- *Milestone 4:* a rolling schedule runs through free play and the Delivery Rush (first event 25 s after a room opens or a break ends; then a 30 s gap in free play, 16 s in a rush). Results and intermission stop and clear it. An event never starts if it would run past the end of the rush.
+- Phases: `inactive → warning (10 s) → active (tornado 30 s / flood 35 s) → recovery (6 s)`. Types alternate.
+- Everything is in synced state (`state.disaster`). Players who join mid-disaster see it straight away.
 - **Tornado:** moves along the road grid on a server-chosen path at 6.5 m/s.
   - Players within 13 m get a capped, decaying push (outward plus swirl), with 2.5 s of protection after a direct hit.
   - Carried cargo loses condition inside the 6 m danger radius. A hit in the 3 m core knocks the package out of your hands.
@@ -77,7 +80,7 @@ Versions: **colyseus 0.18.12**, **@colyseus/schema 5.0.x**, **@colyseus/sdk 0.18
 | VIP box | 1200 | Medium | ✓ | ✓ |
 
 - Condition runs from 100 to 0. Reward = `base × (0.5 + 0.5 × condition/100)`. At 0 the package breaks: it disappears, a fresh one restocks, and nobody scores.
-- Damage sources: the tornado, flood water while on the ground, dropping a fragile package (**G**) while running, and truck crashes above 7 m/s with fragile cargo.
+- Damage sources: the tornado, flood water while on the ground, dropping a fragile package (**Q** since M4) while running, and truck crashes above 7 m/s with fragile cargo.
 - A package left on the ground for 60 s returns to a free depot pad.
 
 **Trucks** (`T1`, `T2`, parked at the depot): the driving model is `stepVehicle()` in `shared.js`, shared by the client's prediction and the server.
@@ -100,6 +103,61 @@ Versions: **colyseus 0.18.12**, **@colyseus/schema 5.0.x**, **@colyseus/sdk 0.18
 
 The truck model's orientation is assumed to be +Z forward. If it drives sideways, set `rotationY` for `cargotruck` in `ASSET_CONFIG` (for example `Math.PI / 2`).
 
+## Milestone 4 — continuous city, Delivery Rush, jumping, knockback, props, social
+
+**Lifecycle** (`setPhase` / `advancePhase` in `game-server.js`; `CYCLE` in `shared.js`; all timestamps are server epoch ms in state):
+
+| Phase | Default | What happens |
+|---|---|---|
+| `free_play` | 90 s for a new room, then 45 s | Deliveries count for the session score. Hazards on. HUD: "Free play · next rush in". |
+| `rush_warning` | 10 s | Banner + countdown. Still free play rules. |
+| `delivery_rush` | 240 s | `rushScore`/`rushDeliveries`/`rushBest` reset at the start and count only during the rush. Live rush standings + your position. Golden Package. |
+| `results` | 15 s | Podium, all scores, deliveries, best delivery, personal best (session), golden winner. Movement frozen, interactions refused, no hazards or knockback. |
+| `intermission` | 20 s | A break without a menu: the city stays explorable, no hazards, no deliveries. |
+
+- The session `score` is kept across rushes; nothing is persisted (no coins, XP, garage).
+- `endRush` calls `onRushRewards(results)`, which only computes a preview through `computeRushRewards()` (`granted: false`). Milestones 5/6 can grant and persist rewards there.
+- **Ad-ready break hook:** during intermission a client can send `busy {busy:true}` (and `breakReady` / `busy {busy:false}`). Free play waits for busy clients for at most `BREAK_MAX_EXTRA_WAIT_SECONDS` (8 s). The server never pauses. Client side: `game.setBreakBusy(true/false)` (or `DD.setBreakBusy` in the console).
+
+**Jumping (Space):**
+- About 1.4 m high, one jump (no double jump), limited air control. Ground detection includes the tops of crates, containers and parkour pieces (`supportHeight()` in `shared.js`).
+- Simulated by the shared `stepMovement()`: the client predicts it and the server validates it. Input flag bit 4 = jump.
+- Heavy and very heavy cargo can't jump. Stunned couriers can't move or jump.
+- **No jump clip exists in the GLBs**, so the airborne pose is procedural: the run stride is nearly frozen, plus a lean and squash/stretch. A clip whose name contains `jump`/`leap`/`fall` is used automatically if you add one.
+
+**Knockback** (server only; `KNOCKBACK` in `shared.js`):
+- Sources: a moving truck (≥ 3 m/s) hitting a courier, rolling platform carts / pallet jacks (≥ 3.2 m/s, never their own pusher), and the tornado core (launch + 0.9 s stun).
+- Every hit is a capped impulse (≤ 12) plus an upward launch and a short stun, with a 0.9 s cooldown and 1.6 s protection afterwards.
+- Never during results or intermission, and never the driver. Couriers don't shove each other (anti-grief). Truck hits don't make you drop cargo.
+- The client shows a stumble (lean back + wobble), stars, camera shake and a toast.
+
+**Interactive props** (`state.props`, `stepProp()` in `shared.js`):
+- 19 traffic cones, 5 wooden crates, the platform cart and the pallet jack are server-owned dynamic objects. Couriers bump into them like trucks.
+- Walking into one pushes it: cones fly, crates slide slowly, carts roll far. Trucks plough through them.
+- A prop left more than 3 m from home for 60 s goes back, but never while anyone is within 8 m of it or of its home.
+
+**Social:**
+- **T** opens a quick-chat wheel with 8 presets (Hello!, Follow me!, Help me!, Nice!, Thanks!, Watch out!, Let's deliver!, GG!), 1.5 s cooldown.
+- **G** opens an emote wheel (Wave, Dance, Cheer, Point, Laugh). The emote id plus its server start time are synced; moving, jumping, a hit or driving interrupts it.
+- Pick with 1-8 or the mouse; Esc closes. The mouse is freed while a wheel is open and re-locked after picking.
+- **Drop moved to Q.**
+- **No emote clips exist in the GLBs** (character1 has `agree`/`run`-style clips only). Gestures are procedural: arm/spine/head bones are rotated when the rig exposes them (Mixamo/Blender/Unity names), and there is whole-body motion either way. Clips named `wave`, `dance`, `cheer`, `point` or `laugh` are used automatically if present.
+
+**Golden Package** (`GOLDEN` in `shared.js`):
+- At most one per rush, 45–100 s in, at one of 6 city spots (never the depot). It is announced with a banner and feed message, and marked by a gold light pillar and a gold minimap star.
+- The first courier to pick it up owns it. Nobody else can take it, even after a drop.
+- It must be carried on foot (it can't be loaded into a truck). The destination is at least 70 m away. Reward is 2000 base, condition-based.
+- It disappears after 75 s or when the rush ends. The winner is flagged in the results.
+
+**Parkour shortcuts** (static, `L.parkour` in `buildLayout()`; colliders tagged `parkour`):
+1. **Alley hurdles:** the west block's alley crossing is fenced by 0.7 m hurdles. Jump them to cut through the block instead of walking around it.
+2. **Construction scaffold:** the east block's alley crossing is a fenced building site. Scaffold steps lead over the 2.2 m fence on both sides.
+3. **Depot crate steps:** crate steps climb a crate wall west of the warehouse, a quick hop out toward the north road.
+
+All delivery doors and golden spots stay reachable on foot without jumping (checked by the tests), and the parkour areas are only reachable by jumping. Trucks keep to the streets.
+
+**Effects (client only):** one pooled instanced particle system for landing dust, knockback stars, pickup sparkles, delivery confetti and golden sparkles, plus modest camera shake on hits and hard landings.
+
 ## Local testing
 
 ```bash
@@ -116,7 +174,7 @@ Manual checks:
 2. **Private rooms:** CREATE PRIVATE ROOM in A, read the code from the HUD, then type it and press JOIN in B.
 3. **Room separation:** create a second private room in a third window. Nobody from the first room should appear.
 4. **Packages / scoring:** walk to a blue pad and press **E**. B sees the box on A's character. Follow the beam and press **E** at the ring. Both leaderboards update.
-5. **Match loop fast:** stop the server and run `npm run test:server` (45 s matches). On Windows PowerShell, set the variables first: `$env:MATCH_SECONDS=45; npm start`.
+5. **Rush loop fast:** stop the server and run `npm run test:server` (4 s free play, 60 s rush). On Windows PowerShell, set the variables first, e.g. `$env:FIRST_FREE_PLAY_SECONDS=10; $env:RUSH_SECONDS=60; npm start`.
 6. **Disconnects:** turn Wi-Fi off and back on within 20 s; you reconnect into the same body. Close a tab; the courier disappears for others after the reconnect window.
 7. **CrazyGames flows without the platform (localhost only):**
    - `?cgMock=1&cgInstant=1` simulates instant multiplayer.
@@ -128,7 +186,7 @@ Manual checks:
 Milestone 3 scenarios (each needs the server started with the settings at the top of `test-milestone3.js`):
 
 ```bash
-MATCH_SECONDS=300 DISASTER_TYPES=none PACKAGE_POOL=groceries DROP_DAMAGE=60 RECONNECT_SECONDS=3 npm start   # terminal 1
+RUSH_SECONDS=300 DISASTER_TYPES=none PACKAGE_POOL=groceries DROP_DAMAGE=60 RECONNECT_SECONDS=3 npm start    # terminal 1
 SCENARIO=trucks npm run test:m3                                                                             # terminal 2
 ```
 
@@ -139,6 +197,9 @@ Automated server tests (real Colyseus clients):
 ```bash
 npm run test:server            # terminal 1 (short timers)
 npm test                       # terminal 2
+
+npm run test:m4server          # Milestone 4: terminal 1
+npm run test:m4                # terminal 2 (UNIT_ONLY=1 npm run test:m4 runs just the unit checks, no server)
 ```
 
 ## Production deployment — Colyseus Cloud (EU Frankfurt + US Chicago)
@@ -165,7 +226,7 @@ The client is already configured for both regions:
    - `ALLOWED_ORIGINS=.crazygames.com,localhost,127.0.0.1`. Drop the localhost entries once you've finished testing from your machine.
    - Optionally `CRAZYGAMES_GAME_ID=<your id>`.
    - `REGION` isn't needed: the client tags the region itself.
-4. Check that each region runs the new build: open `https://de-fra-16001d69.colyseus.cloud/health` and `https://us-ord-c5ea260f.colyseus.cloud/health`. Both should return `{"ok":true,...,"protocol":1}`. Anything else (404, a different page) means an older build is still deployed.
+4. Check that each region runs the new build: open `https://de-fra-16001d69.colyseus.cloud/health` and `https://us-ord-c5ea260f.colyseus.cloud/health`. Both should return `{"ok":true,...,"protocol":4}` (Milestone 4). Anything else (404, a different page) means an older build is still deployed.
 
 ### Test against the live servers from your PC
 
@@ -187,9 +248,16 @@ Each region runs one process (`instances: 1`), which fits the 1 shared vCPU plan
 
 ## Status: implemented vs still needs platform testing
 
-Verified here:
-- 48 automated server checks (node clients).
-- 27 checks in two to four real headless Chrome windows against a local server. These used a stub that mimics the documented SDK v3 calls, not the real SDK.
+Verified here (Milestone 4 build, all run against a local server):
+- Node clients:
+  - `test-multiplayer.js`: 52/52, including the new lifecycle checks.
+  - `test-milestone3.js`: tornado 24/24, flood 17/17, trucks 31/31.
+  - `test-milestone4.js`: 54/54, i.e. 17 unit checks and 37 live checks.
+- Headless Chrome against the local server, using a stub that mimics the documented CrazyGames SDK v3 calls (not the real SDK):
+  - M4 browser suite: 22/22.
+  - M3 browser suite: 20/20.
+  - M2 browser suite: 26-27/27. Its "remote animation = run at 500 ms" check is timing-sensitive at the ~3 FPS of software rendering. Measured input→server latency is the same as the Milestone 3 build (~0.9 s in that sandbox).
+- The real GLB models were not available in the test sandbox, so the tests ran with placeholder shapes. Procedural emote bone gestures in particular need checking with the real characters.
 
 Still requires CrazyGames-side testing:
 - Real friend invites, instant multiplayer from the CrazyGames UI, and token verification with real accounts.
@@ -199,4 +267,6 @@ Still requires CrazyGames-side testing:
 Not done yet:
 - Pure spectating of a *full* room (a full room is refused instead).
 - Vendoring the CDN scripts locally.
-- Mobile/touch controls.
+- Mobile/touch controls (no touch jump / wheel yet).
+- Sound effects.
+- Permanent economy (coins, XP, garage) — by design, Milestones 5/6.

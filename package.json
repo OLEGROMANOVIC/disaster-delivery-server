@@ -1,15 +1,17 @@
 {
   "name": "disaster-delivery",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node test-multiplayer.js",
-    "test:server": "MATCH_SECONDS=45 INTERMISSION_SECONDS=4 LATE_JOIN_SECONDS=5 RECONNECT_SECONDS=6 DISASTER_TYPES=none PACKAGE_POOL=box,groceries node server.js",
+    "test:server": "FIRST_FREE_PLAY_SECONDS=4 FREE_PLAY_SECONDS=3 RUSH_WARNING_SECONDS=2 RUSH_SECONDS=60 RESULTS_SECONDS=3 INTERMISSION_SECONDS=3 LATE_JOIN_SECONDS=5 RECONNECT_SECONDS=6 DISASTER_TYPES=none GOLDEN_AT=9999 PACKAGE_POOL=box,groceries node server.js",
     "test:m3": "node test-milestone3.js",
-    "build": "node --check shared.js && node --check game-server.js && node --check server.js"
+    "test:m4server": "FIRST_FREE_PLAY_SECONDS=75 FREE_PLAY_SECONDS=5 RUSH_WARNING_SECONDS=3 RUSH_SECONDS=75 RESULTS_SECONDS=4 INTERMISSION_SECONDS=3 BREAK_MAX_EXTRA_WAIT_SECONDS=3 DISASTER_TYPES=none GOLDEN_AT=3 GOLDEN_SPOT=0 GOLDEN_LIFETIME=60 PROP_RESET_SECONDS=6 PACKAGE_POOL=box node server.js",
+    "test:m4": "node test-milestone4.js",
+    "build": "node --check shared.js && node --check game-server.js && node --check server.js && node --check reachability.js"
   },
   "engines": {
     "node": ">=22"

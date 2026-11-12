@@ -3,9 +3,10 @@
    Real Colyseus clients against a running server. Each scenario needs
    the server started with specific settings:
 
-   SCENARIO=tornado  →  MATCH_SECONDS=120 INTERMISSION_SECONDS=4 DISASTER_TYPES=tornado TORNADO_PATH="-30,25;30,25" PACKAGE_POOL=groceries npm start
-   SCENARIO=flood    →  MATCH_SECONDS=240 DISASTER_TYPES=flood FLOOD_ZONES=F1 PACKAGE_POOL=groceries npm start
-   SCENARIO=trucks   →  MATCH_SECONDS=300 DISASTER_TYPES=none PACKAGE_POOL=groceries DROP_DAMAGE=60 RECONNECT_SECONDS=3 npm start
+   SCENARIO=tornado  →  FIRST_FREE_PLAY_SECONDS=5 RUSH_WARNING_SECONDS=2 RUSH_SECONDS=70 RESULTS_SECONDS=3 INTERMISSION_SECONDS=3
+                         DISASTER_FIRST_DELAY=20 DISASTER_ACTIVE=15 DISASTER_TYPES=tornado TORNADO_PATH="-30,25;30,25" PACKAGE_POOL=groceries npm start
+   SCENARIO=flood    →  RUSH_SECONDS=240 DISASTER_FIRST_DELAY=20 DISASTER_TYPES=flood FLOOD_ZONES=F1 PACKAGE_POOL=groceries npm start
+   SCENARIO=trucks   →  RUSH_SECONDS=300 DISASTER_TYPES=none PACKAGE_POOL=groceries DROP_DAMAGE=60 RECONNECT_SECONDS=3 npm start
 
    then:  SCENARIO=<name> node test-milestone3.js
    ===================================================================== */
@@ -162,11 +163,13 @@ async function tornado() {
   check('P7 fragile package lost condition in the tornado', minCond < 100 || !pNow, `min condition ${minCond}`);
   check('P8 condition is synchronized to other clients', !pNow || (pOther && pOther.condition === pNow.condition));
   check('T2 knock-out event fired (core hit)', knocked);
-  console.log(`   … waiting for match end (${a.s.timeLeft}s)`);
-  await waitFor(() => a.s.phase === 'results', (a.s.timeLeft + 5) * 1000, 200);
-  check('D7 disaster cleaned up at match end', a.s.disaster.phase === 'inactive' && a.s.disaster.type === 'none' && a.s.disaster.floods.size === 0);
-  await waitFor(() => a.s.phase === 'playing', 20000, 200);
-  check('D8 next match starts with a fresh, inactive disaster + same group', a.s.disaster.phase === 'inactive' && a.s.players.size === 3 && a.room.roomId === late.room.roomId);
+  console.log(`   … waiting for the rush to end (${a.s.phase}, ${a.s.timeLeft}s)`);
+  await waitFor(() => a.s.phase === 'results', 120000, 200);
+  check('D7 disaster cleaned up when the rush ends', a.s.disaster.phase === 'inactive' && a.s.disaster.type === 'none' && a.s.disaster.floods.size === 0);
+  await waitFor(() => a.s.phase === 'intermission', 10000, 200);
+  check('D7b no hazards during the intermission break', a.s.disaster.phase === 'inactive');
+  await waitFor(() => a.s.phase === 'free_play', 10000, 200);
+  check('D8 free play resumes with a fresh, inactive disaster + same group', a.s.disaster.phase === 'inactive' && a.s.players.size === 3 && a.room.roomId === late.room.roomId);
   for (const x of [a, b, late, room2]) await x.leave();
 }
 

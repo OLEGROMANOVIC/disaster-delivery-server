@@ -2,8 +2,7 @@
    Automated multiplayer tests — real Colyseus clients against a running
    server. Start the server with short timers first, e.g.:
 
-     MATCH_SECONDS=45 INTERMISSION_SECONDS=4 LATE_JOIN_SECONDS=5 \
-     RECONNECT_SECONDS=6 npm start
+     npm run test:server      (short phase timers, see package.json)
 
    then:  npm test        (or SERVER_URL=ws://host:port npm test)
    ===================================================================== */
@@ -253,31 +252,39 @@ async function main() {
   await waitFor(() => !p1.room.state.players.has(fill[1].room.sessionId), 2000);
   check('T8 consented leave removes the player for everyone', !p1.room.state.players.has(fill[1].room.sessionId));
 
-  /* ---------- Test 7 + late join: match transition keeps the group ---------- */
+  /* ---------- Test 7 + late join: the city persists across Delivery Rush events ---------- */
   const roomBefore = a.room.roomId;
-  const matchBefore = a.room.state.matchNumber;
+  await waitFor(() => a.room.state.phase === 'delivery_rush', 15000, 100);
+  const rushBefore = a.room.state.rushNumber;
+  check('C1 room is in a Delivery Rush', a.room.state.phase === 'delivery_rush' && rushBefore >= 1, `${a.room.state.phase} #${rushBefore}`);
   const late = new Bot('LATE');
   await late.joinCode(roomBefore);
   await waitFor(() => late.me);
-  check('LJ late joiner becomes spectator mid-match', late.me?.role === 'spectator', late.me?.role);
+  check('LJ late joiner becomes spectator mid-rush', late.me?.role === 'spectator', late.me?.role);
   const solo = new Bot('SOLO');
   await solo.joinCode(q1.room.roomId);
   await waitFor(() => solo.me);
   check('LJ friend joining a host who is alone plays immediately', solo.me?.role === 'active', solo.me?.role);
-  console.log(`   … waiting for the match timer (${a.room.state.timeLeft}s left)`);
+  console.log(`   … waiting for the rush timer (${a.room.state.timeLeft}s left)`);
+  const sessionScore = carrier.me.score;
   await waitFor(() => a.room.state.phase === 'results', (a.room.state.timeLeft + 5) * 1000, 200);
-  check('T7 match ends into results phase', a.room.state.phase === 'results');
-  check('T7 results list ranks players', a.room.state.results.length >= 2 && a.room.state.results[0].score >= a.room.state.results[a.room.state.results.length - 1].score);
+  check('T7 rush ends into results phase', a.room.state.phase === 'results');
+  check('T7 results list ranks players by rush score', a.room.state.results.length >= 2 && a.room.state.results[0].score >= a.room.state.results[a.room.state.results.length - 1].score);
   const scoreAtEnd = carrier.me.score;
   carrier.room.send('interact');
   await sleep(300);
   check('T7 scoring frozen during results', carrier.me.score === scoreAtEnd);
-  await waitFor(() => a.room.state.phase === 'playing' && a.room.state.matchNumber === matchBefore + 1, 20000, 200);
-  check('T7 next match starts in the same room', a.room.state.phase === 'playing' && a.room.roomId === roomBefore && a.room.state.matchNumber === matchBefore + 1);
+  check('LJ spectator promoted to active when the rush ends', late.me?.role === 'active');
+  await waitFor(() => a.room.state.phase === 'intermission', 8000, 100);
+  check('C2 results are followed by an intermission break', a.room.state.phase === 'intermission');
+  await waitFor(() => a.room.state.phase === 'free_play', 8000, 100);
+  check('C3 intermission returns to free play in the same room', a.room.state.phase === 'free_play' && a.room.roomId === roomBefore);
+  await waitFor(() => a.room.state.phase === 'delivery_rush' && a.room.state.rushNumber === rushBefore + 1, 20000, 100);
+  check('T7 next rush starts in the same room', a.room.state.phase === 'delivery_rush' && a.room.roomId === roomBefore && a.room.state.rushNumber === rushBefore + 1);
   check('T7 same group still present', [a, b, late, pub].every(x => a.room.state.players.has(x.room.sessionId)));
-  check('T7 scores reset for the new match', [...a.room.state.players.values()].every(p => p.score === 0));
-  check('LJ spectator promoted to active at next round', late.me?.role === 'active');
-  check('T7 packages restocked', a.room.state.packages.size === GAME.maxPackages);
+  check('T7 rush scores reset for the new rush', [...a.room.state.players.values()].every(p => p.rushScore === 0));
+  check('C4 session score is kept across rushes', carrier.me.score === sessionScore && sessionScore > 0, `${carrier.me.score} vs ${sessionScore}`);
+  check('T7 packages stocked', a.room.state.packages.size === GAME.maxPackages);
 
   for (const x of [a, b, p1, p2, q1, pub, late, solo, ...fill.slice(2)]) await x.leave();
   await sleep(500);
