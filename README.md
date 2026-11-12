@@ -12,6 +12,8 @@ DisasterDelivery/
 ├── test-multiplayer.js automated multi-client tests against a running server (M2 + lifecycle)
 ├── test-milestone3.js  disaster / package condition / truck scenarios
 ├── test-milestone4.js  continuous city, jumping, knockback, props, social, Golden Package, parkour
+├── bots.js             server-only bot couriers: navigation grid, A* pathing, behaviour
+├── test-bots.js        bot fill / replacement / behaviour tests
 ├── reachability.js     walkability + path helper used by the M4 tests (not needed by the game)
 ├── package.json / package-lock.json
 ├── .env.example        server configuration
@@ -158,6 +160,26 @@ All delivery doors and golden spots stay reachable on foot without jumping (chec
 
 **Effects (client only):** one pooled instanced particle system for landing dust, knockback stars, pickup sparkles, delivery confetti and golden sparkles, plus modest camera shake on hits and hard landings.
 
+## Bots — rooms are never empty
+
+The game is multiplayer only. When a room has few real players, the server tops it up with bot couriers to `BOT_FILL` (default 4). Real players always come first:
+- A joining player takes a bot's seat at once (a bot leaves; the total stays the same).
+- Six real players means no bots at all.
+- Capacity, `joinable` and CrazyGames `isJoinable` count real players only, so bots never block a friend.
+- When real players leave, bots come back one at a time a couple of seconds apart, like new players arriving. When the last real player leaves, the bots go too and the room closes.
+- Between rushes a bot sometimes leaves and a different one joins, the way real lobbies churn.
+
+How they behave (`bots.js`, all server-side):
+- Each tick a bot produces an ordinary movement input that goes through the same queue, physics, rate limits and cooldowns as a human's. Pickups, deliveries, drops, emotes and quick chat use the same handlers, so bots can't do anything a player can't.
+- They path along streets (A* on a navigation grid built once per process, with corner smoothing), sprint, wobble slightly, hop now and then, and pause briefly after picking up or delivering.
+- They pick packages nobody else is heading for, preferring close and valuable ones. They never take a package a real player is standing next to, and they leave pianos (truck-only) to humans.
+- They race for the Golden Package after a reaction delay, flee a nearby tornado, wander during free play and breaks, and get unstuck by side-stepping, jumping and re-planning.
+- They react like people: "Let's deliver!" at the rush warning, a cheer for the winner and "GG!" at results, "Nice!" when someone else lands the Golden Package, emotes during breaks.
+- Each bot has its own personality: skill, how often it sprints, how jumpy it is, how chatty.
+- Names look like the ones players have: guest-style `Courier###`, usernames like `FunkyYeti` or `emmaxpro`. No bot flag is sent to clients.
+
+Settings: `BOT_FILL` (0 turns bots off), `BOT_JOIN_DELAY` (average seconds between bots arriving), `BOTS_IN_PRIVATE=false` keeps private rooms bot-free, and `BOT_TAG=1` adds a visible 🤖 to bot names if you ever need to label them. Bots don't drive trucks yet.
+
 ## Local testing
 
 ```bash
@@ -200,7 +222,12 @@ npm test                       # terminal 2
 
 npm run test:m4server          # Milestone 4: terminal 1
 npm run test:m4                # terminal 2 (UNIT_ONLY=1 npm run test:m4 runs just the unit checks, no server)
+
+npm run test:botserver         # bots: terminal 1
+npm run test:bots              # terminal 2
 ```
+
+All other test servers run with `BOT_FILL=0`, so their exact player counts hold.
 
 ## Production deployment — Colyseus Cloud (EU Frankfurt + US Chicago)
 
@@ -253,6 +280,7 @@ Verified here (Milestone 4 build, all run against a local server):
   - `test-multiplayer.js`: 52/52, including the new lifecycle checks.
   - `test-milestone3.js`: tornado 24/24, flood 17/17, trucks 31/31.
   - `test-milestone4.js`: 54/54, i.e. 17 unit checks and 37 live checks.
+  - `test-bots.js`: 20/20 in two consecutive runs on the final code.
 - Headless Chrome against the local server, using a stub that mimics the documented CrazyGames SDK v3 calls (not the real SDK):
   - M4 browser suite: 22/22.
   - M3 browser suite: 20/20.

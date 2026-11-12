@@ -3,6 +3,7 @@
    Real Colyseus clients against a running server. Each scenario needs
    the server started with specific settings:
 
+   (add BOT_FILL=0 to every line)
    SCENARIO=tornado  →  FIRST_FREE_PLAY_SECONDS=5 RUSH_WARNING_SECONDS=2 RUSH_SECONDS=70 RESULTS_SECONDS=3 INTERMISSION_SECONDS=3
                          DISASTER_FIRST_DELAY=20 DISASTER_ACTIVE=15 DISASTER_TYPES=tornado TORNADO_PATH="-30,25;30,25" PACKAGE_POOL=groceries npm start
    SCENARIO=flood    →  RUSH_SECONDS=240 DISASTER_FIRST_DELAY=20 DISASTER_TYPES=flood FLOOD_ZONES=F1 PACKAGE_POOL=groceries npm start

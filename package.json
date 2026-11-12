@@ -7,11 +7,13 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node test-multiplayer.js",
-    "test:server": "FIRST_FREE_PLAY_SECONDS=4 FREE_PLAY_SECONDS=3 RUSH_WARNING_SECONDS=2 RUSH_SECONDS=60 RESULTS_SECONDS=3 INTERMISSION_SECONDS=3 LATE_JOIN_SECONDS=5 RECONNECT_SECONDS=6 DISASTER_TYPES=none GOLDEN_AT=9999 PACKAGE_POOL=box,groceries node server.js",
+    "test:server": "BOT_FILL=0 FIRST_FREE_PLAY_SECONDS=4 FREE_PLAY_SECONDS=3 RUSH_WARNING_SECONDS=2 RUSH_SECONDS=60 RESULTS_SECONDS=3 INTERMISSION_SECONDS=3 LATE_JOIN_SECONDS=5 RECONNECT_SECONDS=6 DISASTER_TYPES=none GOLDEN_AT=9999 PACKAGE_POOL=box,groceries node server.js",
     "test:m3": "node test-milestone3.js",
-    "test:m4server": "FIRST_FREE_PLAY_SECONDS=75 FREE_PLAY_SECONDS=5 RUSH_WARNING_SECONDS=3 RUSH_SECONDS=75 RESULTS_SECONDS=4 INTERMISSION_SECONDS=3 BREAK_MAX_EXTRA_WAIT_SECONDS=3 DISASTER_TYPES=none GOLDEN_AT=3 GOLDEN_SPOT=0 GOLDEN_LIFETIME=60 PROP_RESET_SECONDS=6 PACKAGE_POOL=box node server.js",
+    "test:m4server": "BOT_FILL=0 FIRST_FREE_PLAY_SECONDS=75 FREE_PLAY_SECONDS=5 RUSH_WARNING_SECONDS=3 RUSH_SECONDS=75 RESULTS_SECONDS=4 INTERMISSION_SECONDS=3 BREAK_MAX_EXTRA_WAIT_SECONDS=3 DISASTER_TYPES=none GOLDEN_AT=3 GOLDEN_SPOT=0 GOLDEN_LIFETIME=60 PROP_RESET_SECONDS=6 PACKAGE_POOL=box node server.js",
     "test:m4": "node test-milestone4.js",
-    "build": "node --check shared.js && node --check game-server.js && node --check server.js && node --check reachability.js"
+    "test:botserver": "BOT_FILL=4 BOT_JOIN_DELAY=0.6 FIRST_FREE_PLAY_SECONDS=40 RUSH_WARNING_SECONDS=3 RUSH_SECONDS=70 RESULTS_SECONDS=5 INTERMISSION_SECONDS=4 DISASTER_TYPES=none GOLDEN_AT=4 GOLDEN_SPOT=0 PACKAGE_POOL=box,groceries,crate node server.js",
+    "test:bots": "node test-bots.js",
+    "build": "node --check shared.js && node --check game-server.js && node --check server.js && node --check reachability.js && node --check bots.js"
   },
   "engines": {
     "node": ">=22"

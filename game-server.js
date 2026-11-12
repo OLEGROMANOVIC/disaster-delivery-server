@@ -13,6 +13,7 @@ import {
   distanceXZ, deliveryReward, packageDef, weightOf, floodAt, vehicleGeometry, vehicleCircles, cargoSlotsUsed,
   resolveInteraction, mulberry32, applyKnock, stepProp, separateProps, propCircles, computeRushRewards
 } from './shared.js';
+import { createNavGrid, makeBotName, BotBrain } from './bots.js';
 
 /* ---------------------------------------------------------------------
    Configuration (environment variables — see .env.example)
@@ -52,7 +53,13 @@ const CONFIG = {
   goldenAt: env.GOLDEN_AT !== undefined && env.GOLDEN_AT !== '' ? num(env.GOLDEN_AT, null) : null,
   goldenSpot: env.GOLDEN_SPOT !== undefined && env.GOLDEN_SPOT !== '' ? num(env.GOLDEN_SPOT, null) : null,
   goldenLifetime: num(env.GOLDEN_LIFETIME, GOLDEN.lifetimeSeconds),
-  propResetSeconds: num(env.PROP_RESET_SECONDS, PROPS.resetIdleSeconds)
+  propResetSeconds: num(env.PROP_RESET_SECONDS, PROPS.resetIdleSeconds),
+  // Bots: while a room has real players, bots top it up to BOT_FILL couriers (0 = off).
+  // Real players always take precedence: a bot leaves the moment a seat is needed.
+  botFill: num(env.BOT_FILL, 4),
+  botJoinDelay: num(env.BOT_JOIN_DELAY, 2.5),              // average seconds between bots "joining"
+  botsInPrivate: env.BOTS_IN_PRIVATE !== 'false',
+  botTag: env.BOT_TAG === '1'                              // optional visible "🤖" name prefix
 };
 if (env.DROP_DAMAGE !== undefined && Number.isFinite(Number(env.DROP_DAMAGE))) CONDITION.dropDamage = Number(env.DROP_DAMAGE);
 
@@ -249,6 +256,8 @@ const WORLD = createPhysicsWorld(LAYOUT);
 const ZERO_WALK = { mx: 0, mz: 0, sp: false, jp: false };
 const ZERO_DRIVE = { steer: 0, throttle: 0, brake: true };
 const DT = NET.fixedDt;
+let NAV = null;                                            // bot navigation grid, built on first use
+const nav = () => (NAV ||= createNavGrid(LAYOUT, WORLD));
 
 function randomCode() {
   let s = '';
@@ -486,6 +495,13 @@ export class CityRoom extends Room {
       this.psims.set(pr.id, { kind: pr.kind, x: pr.x, z: pr.z, yaw: pr.rotY, vx: 0, vz: 0, home: pr, lastActive: Date.now(), pusher: '' });
     }
     this.goldenAt = Infinity; this.goldenWinner = '';
+    this.bots = new Map();             // sessionId -> BotBrain (server-only; not visible to clients)
+    this.nextBotAt = 0; this.botSeq = 0;
+    const broadcast = this.broadcast.bind(this);
+    this.broadcast = (type, msg, opts) => {
+      broadcast(type, msg, opts);
+      if (type === 'phase' || type === 'golden') for (const b of this.bots.values()) b.onEvent(type, msg);
+    };
 
     if (mode === 'private') await this.setPrivate(true);
     await this.setMetadata({ mode, region: CONFIG.region, code });
@@ -520,7 +536,7 @@ export class CityRoom extends Room {
     if (options.protocol !== undefined && options.protocol !== PROTOCOL_VERSION) {
       throw new ServerError(4426, 'Game version mismatch — please reload.');
     }
-    if (this.state.players.size >= GAME.maxPlayers) {
+    if (this.realCount() >= GAME.maxPlayers) {          // bots never count: they make room
       throw new ServerError(4429, 'This room is full.');
     }
     const skin = sanitizeSkin(options.skin);
@@ -551,9 +567,12 @@ export class CityRoom extends Room {
     const p = new PlayerState();
     // Late-join policy: only a Delivery Rush that is well under way makes newcomers spectate
     // until it ends (unless fewer than 2 couriers are active). Free play / breaks: join at once.
+    if (this.state.players.size >= GAME.maxPlayers) this.removeBot();   // a real player takes a bot's seat
+    let realActive = 0;
+    for (const [sid, q] of this.state.players) if (!this.bots.has(sid) && q.role === 'active') realActive++;
     const lateJoin = this.state.phase === PHASES.RUSH
       && now - this.state.rushStartedAt > CONFIG.lateJoinWindowSeconds * 1000
-      && this.state.activeCount >= 2;
+      && realActive >= 2;
     Object.assign(p, {
       sessionId: client.sessionId, name: auth.name, verified: !!auth.verified, skin: auth.skin || 1,
       role: lateJoin ? 'spectator' : 'active', connected: true, slot: this.freeSlot()
@@ -563,7 +582,8 @@ export class CityRoom extends Room {
     this.writePlayer(p, sim);
     this.state.players.set(client.sessionId, p);
     this.updateCounts();
-    console.log(`[room ${this.roomId}] ${p.name} joined as ${p.role} (${this.state.playerCount}/${GAME.maxPlayers})`);
+    this.balanceBots(now);
+    console.log(`[room ${this.roomId}] ${p.name} joined as ${p.role} (${this.realCount()} real + ${this.bots.size} bots)`);
   }
 
   async onDrop(client) {
@@ -603,7 +623,9 @@ export class CityRoom extends Room {
     this.state.players.delete(sid);
     this.sims.delete(sid);
     this.updateCounts();
-    console.log(`[room ${this.roomId}] ${p?.name || sid} left (${this.state.playerCount}/${GAME.maxPlayers})`);
+    this.nextBotAt = Math.max(this.nextBotAt, Date.now() + this.botDelay());   // a "new player" shows up a bit later
+    this.balanceBots(Date.now());
+    console.log(`[room ${this.roomId}] ${p?.name || sid} left (${this.realCount()} real + ${this.bots.size} bots)`);
   }
 
   onDispose() {
@@ -663,12 +685,76 @@ export class CityRoom extends Room {
     if (v.state !== st) v.state = st;
   }
 
+  realCount() { return this.state.players.size - (this.bots?.size || 0); }
   updateCounts() {
     let active = 0;
     for (const p of this.state.players.values()) if (p.role === 'active') active++;
-    this.state.playerCount = this.state.players.size;
+    this.state.playerCount = this.state.players.size;            // what the HUD shows (bots included)
     this.state.activeCount = active;
-    this.state.joinable = this.state.players.size < GAME.maxPlayers;
+    this.state.joinable = this.realCount() < GAME.maxPlayers;    // bots never block a real player
+  }
+
+  /* ---------------- bots ---------------- */
+  botDelay() { return CONFIG.botJoinDelay * 1000 * (0.5 + Math.random()); }
+  wantedBots() {
+    const real = this.realCount();
+    if (real === 0 || CONFIG.botFill <= 0) return 0;
+    if (this.state.mode === 'private' && !CONFIG.botsInPrivate) return 0;
+    return Math.max(0, Math.min(CONFIG.botFill, GAME.maxPlayers) - real);
+  }
+  balanceBots(now) {
+    const want = this.wantedBots();
+    while (this.bots.size > want) this.removeBot();
+    if (this.bots.size < want && this.state.players.size < GAME.maxPlayers && now >= this.nextBotAt) {
+      this.addBot();
+      this.nextBotAt = now + this.botDelay();
+    }
+  }
+  addBot() {
+    const sid = `bot${++this.botSeq}${Math.random().toString(36).slice(2, 7)}`;
+    const taken = new Set([...this.state.players.values()].map(p => p.name));
+    const p = new PlayerState();
+    Object.assign(p, {
+      sessionId: sid, name: (CONFIG.botTag ? '🤖 ' : '') + makeBotName(taken), verified: false, skin: Math.random() < 0.5 ? 1 : 2,
+      role: 'active', connected: true, slot: this.freeSlot()
+    });
+    const sim = this.createSim(p.slot);
+    sim.botSeq = 0;
+    this.sims.set(sid, sim);
+    this.writePlayer(p, sim);
+    this.state.players.set(sid, p);
+    this.bots.set(sid, new BotBrain(this, sid, nav()));
+    this.updateCounts();
+  }
+  /* Remove one bot (or a specific one): prefer one that isn't carrying or driving anything. */
+  removeBot(sid = null) {
+    if (!this.bots.size) return;
+    if (!sid) {
+      const list = [...this.bots.keys()];
+      sid = list.find(id => { const q = this.state.players.get(id); return q && !q.carrying && !q.driving; }) || list[0];
+    }
+    const p = this.state.players.get(sid), sim = this.sims.get(sid);
+    if (p?.driving) this.releaseVehicle(p, sim, false);
+    if (p?.carrying && sim) this.dropPackage(p, sim, 0);
+    for (const pkg of this.state.packages.values()) if (pkg.ownerId === sid) pkg.ownerId = '';
+    this.bots.delete(sid);
+    this.state.players.delete(sid);
+    this.sims.delete(sid);
+    this.updateCounts();
+  }
+  /* Bots produce one input per tick through the normal input queue. */
+  driveBots(now) {
+    for (const [sid, brain] of this.bots) {
+      const sim = this.sims.get(sid);
+      if (!sim) continue;
+      const raw = brain.tick(now, DT);
+      if (!raw || sim.queue.length > 2) continue;
+      const input = sanitizeMoveInput(raw);
+      if (!input) continue;
+      input.seq = ++sim.botSeq; input.drive = false;
+      sim.lastQueuedSeq = input.seq;
+      sim.queue.push(input);
+    }
   }
 
   /* Movement modifiers for a walking player: carried weight, flood water, trucks + props. */
@@ -1019,6 +1105,8 @@ export class CityRoom extends Room {
         break;
       case PHASES.RESULTS:
         this.setPhase(PHASES.INTERMISSION, CONFIG.intermissionSeconds, now);
+        // like real lobbies, now and then someone leaves between rushes and someone new arrives
+        if (this.bots.size && Math.random() < 0.35) { this.removeBot(); this.nextBotAt = now + this.botDelay() * 2; }
         break;
       case PHASES.INTERMISSION: {
         // ad-ready hook: wait (briefly) for connected clients that report they are busy
@@ -1090,6 +1178,9 @@ export class CityRoom extends Room {
     this.updateCounts();
     this.setPhase(PHASES.RESULTS, CONFIG.resultsSeconds, now);
     this.goldenWinner = '';
+    // someone usually says GG — let one bot do it if nobody else will
+    const bl = [...this.bots.values()];
+    if (bl.length && Math.random() < 0.9) bl[Math.floor(Math.random() * bl.length)].say(7, 800 + Math.random() * 2500);
   }
 
   /* Reward-calculation hook for a finished rush. Milestones 5/6 will grant + persist rewards
@@ -1353,6 +1444,8 @@ export class CityRoom extends Room {
     const hazards = !isBreakPhase(s.phase);
     const canMove = movementAllowed(s.phase);
 
+    this.balanceBots(now);
+    this.driveBots(now);
     if (hazards) this.disasters.update(now, s.phase, s.rushEndsAt);
     const floods = hazards ? this.disasters.floodsForPhysics : null;
     if (hazards) this.applyTornado(now, floods);
